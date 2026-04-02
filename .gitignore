@@ -1,0 +1,4 @@
+zig-out
+*.bmp
+.DS_Store
+.zig-cache

@@ -1,0 +1,11 @@
+.{
+    .name = .jpeg,
+    .version = "0.0.0",
+    .fingerprint = 0xea72cb32dba36862, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.15.1",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
