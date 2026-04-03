@@ -8,8 +8,9 @@ const print = std.debug.print;
 
 pub fn main() void {
     const allocator = std.heap.page_allocator;
+    const file_name = "snail.bmp";
 
-    const file = std.fs.cwd().openFile("red.bmp", .{}) catch {
+    const file = std.fs.cwd().openFile(file_name, .{}) catch {
         print("Could not open file.\n", .{});
         std.process.exit(1);
     };
@@ -24,7 +25,7 @@ pub fn main() void {
         std.process.exit(1);
     };
 
-    const info = Bitmap.parse(data) catch |err| {
+    const info = Bitmap.parse(file_name, data) catch |err| {
         switch (err) {
             FileFormatError.UnsupportedFormat => print("File is not in a supported format.\n", .{}),
             FileFormatError.InvalidFileHeader => print("The file header is not valid.\n", .{}),
@@ -35,21 +36,11 @@ pub fn main() void {
 
     info.print();
 
-    gui.testWindow(info) catch {
-        print("Could not open file.\n", .{});
+    gui.createWindow(allocator, info) catch |err| {
+        print("Could not draw to screen. {}\n", .{err});
         std.process.exit(1);
     };
 
-    std.process.exit(0);
-    const newFile = std.fs.cwd().createFile("newSnail.bmp", .{}) catch {
-        print("Could not create file.\n", .{});
-        std.process.exit(1);
-    };
-
-    var buf: [4096]u8 = undefined;
-    var writer = newFile.writer(&buf);
-    writer.interface.writeAll(data) catch {};
-    writer.end() catch {};
     std.process.exit(0);
 }
 

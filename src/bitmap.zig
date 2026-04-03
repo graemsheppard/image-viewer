@@ -2,38 +2,40 @@ const std = @import("std");
 const bytesToUsize = @import("util.zig").bytesToUsize;
 
 pub const Bitmap = struct {
+    file_name: []const u8,
     pixels: []u8,
     bytes_per_row: u32,
     file_header: BitmapFileHeader,
     dib_header: DIBHeader,
 
-    pub fn parse(data: []u8) FileFormatError!Bitmap {
+    pub fn parse(file_name: []const u8, data: []u8) FileFormatError!Bitmap {
         if (data.len < 14) return FileFormatError.InvalidFileHeader;
         
         // Handle the headers and their variations
-        const fileHeader = try BitmapFileHeader.parse(data);
+        const file_header= try BitmapFileHeader.parse(data);
 
         // The u16 size at offset 14 is enough to identify the DIB header format
-        const dibSize = bytesToUsize(data[14..18], u32) catch 0;
-        const dibType = if (std.enums.fromInt(DIBHeaderSize, dibSize)) |val| val else return FileFormatError.InvalidDIBHeader;
-        const dibHeader: DIBHeader = switch(dibType) {
+        const dib_size = bytesToUsize(data[14..18], u32) catch 0;
+        const dib_type = if (std.enums.fromInt(DIBHeaderSize, dib_size )) |val| val else return FileFormatError.InvalidDIBHeader;
+        const dib_header: DIBHeader = switch(dib_type ) {
             .bitmap_info_header => .{ .bitmap_info_header = try BitmapInfoHeader.parse(data) },
             .bitmap_core_header => .{ .bitmap_core_header = try BitmapCoreHeader.parse(data) }
         };
         
         // Find the region of data that represents the pixels
-        const bpp = dibHeader.getBpp();
-        const dimensions = dibHeader.getDimensions();
-        const bitsPerRow = bpp * @abs(dimensions.x);
-        const heightUnsigned = @abs(dimensions.y);
-        const bytesPerRow = 4 * ((bitsPerRow + 31) / 32);
-        const pixelDataLen = bytesPerRow * heightUnsigned;
+        const bpp = dib_header.getBpp();
+        const dimensions = dib_header.getDimensions();
+        const bits_per_row = bpp * @abs(dimensions.x);
+        const height_unsigned = @abs(dimensions.y);
+        const bytes_per_row = 4 * ((bits_per_row + 31) / 32);
+        const pixel_data_len= bytes_per_row * height_unsigned ;
         
         const result: Bitmap = .{
-            .file_header = fileHeader,
-            .dib_header = dibHeader,
-            .bytes_per_row = bytesPerRow,
-            .pixels = data[fileHeader.offset..(fileHeader.offset + pixelDataLen)]
+            .file_name = file_name,
+            .file_header = file_header,
+            .dib_header = dib_header,
+            .bytes_per_row = bytes_per_row,
+            .pixels = data[file_header.offset..(file_header.offset + pixel_data_len)]
         };
 
         return result;

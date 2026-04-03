@@ -6,13 +6,13 @@ const gl = @cImport({
     @cInclude("glad/glad.h");
 });
 const bmp = @import("bitmap.zig");
-
+const print = std.debug.print;
 pub const Window = glfw.GLFWwindow;
 
-pub fn testWindow(bitmap: bmp.Bitmap) !void {
+// Initialize our window with the correct size
+pub fn createWindow(_: std.mem.Allocator, bitmap: bmp.Bitmap) GLError!void {
     if (glfw.glfwInit() == 0) {
-        std.debug.print("Failed to initialize GLFW.\n", .{});
-        std.process.exit(1);
+        return GLError.GLFWInitializationError;
     }
     defer glfw.glfwTerminate();
     
@@ -22,27 +22,24 @@ pub fn testWindow(bitmap: bmp.Bitmap) !void {
     glfw.glfwWindowHint(glfw.GLFW_OPENGL_FORWARD_COMPAT, glfw.GL_TRUE);
     glfw.glfwWindowHint(glfw.GLFW_RESIZABLE, glfw.GL_TRUE);
 
-    const window = glfw.glfwCreateWindow(256, 256, "HELLO", null, null);
+    const window = glfw.glfwCreateWindow(256, 256, @ptrCast(bitmap.file_name), null, null);
     
     if (window == null) {
-        std.debug.print("GLFW could not create the window.\n", .{});
-        std.process.exit(1);
+        return GLError.WindowCreationError;
     }
 
     defer glfw.glfwDestroyWindow(window);
-    defer glfw.glfwTerminate();
     glfw.glfwMakeContextCurrent(window);
     glfw.glfwSwapInterval(1);
 
     if (gl.gladLoadGLLoader(@ptrCast(&glfw.glfwGetProcAddress)) == 0) {
-        std.debug.print("Could not initialize OpenGL.\n", .{});
-        std.process.exit(1);
+        return GLError.GLInitializationError;
     }
 
-    var texture_id: gl.GLuint = 0;
+    // Setup the texture with the pixel data
+    var texture_id = createTexture();
     defer gl.glDeleteTextures(1, &texture_id);
     
-    gl.glGenTextures(1, &texture_id);
     gl.glActiveTexture(gl.GL_TEXTURE0);
     gl.glBindTexture(gl.GL_TEXTURE_2D, texture_id);
 
@@ -52,7 +49,6 @@ pub fn testWindow(bitmap: bmp.Bitmap) !void {
     gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR);
 
     const dimensions = bitmap.dib_header.getDimensions();
-
     gl.glTexImage2D(
         gl.GL_TEXTURE_2D,
         0,
@@ -64,50 +60,21 @@ pub fn testWindow(bitmap: bmp.Bitmap) !void {
         gl.GL_UNSIGNED_BYTE,
         @ptrCast(bitmap.pixels)
     );
-    
 
-    const v_shader_id: gl.GLuint = gl.glCreateShader(gl.GL_VERTEX_SHADER);
-    const f_shader_id: gl.GLuint = gl.glCreateShader(gl.GL_FRAGMENT_SHADER);
+    // Initialize vertex array, required before OpenGL can draw
+    var vao: u32 = 0;
+    gl.glGenVertexArrays(1, &vao);
+    gl.glBindVertexArray(vao);
+    defer gl.glDeleteVertexArrays(1, &vao);
+
+    // Setup vertex and fragment shader
+    const v_shader_id: u32 = try createShader(gl.GL_VERTEX_SHADER, vt_shader);
+    const f_shader_id: u32 = try createShader(gl.GL_FRAGMENT_SHADER, ft_shader);
     defer gl.glDeleteShader(v_shader_id);
     defer gl.glDeleteShader(f_shader_id);
-
-    const vertex_shader_ptr: [*]const u8 = vt_shader;
-    const fragment_shader_ptr: [*]const u8 = ft_shader;
-    gl.glShaderSource(v_shader_id, 1, &vertex_shader_ptr, null);
-    gl.glShaderSource(f_shader_id, 1, &fragment_shader_ptr, null);
     
-    gl.glCompileShader(v_shader_id);
-
-    var compileResult: i32 = 0;
-    gl.glGetShaderiv(v_shader_id, gl.GL_COMPILE_STATUS, &compileResult);
-    if (compileResult == gl.GL_FALSE) {
-        var length: i32 = 0;
-        gl.glGetShaderiv(v_shader_id, gl.GL_INFO_LOG_LENGTH, &length);
-        const message = try std.heap.page_allocator.alloc(u8, @intCast(@abs(length)));
-        defer std.heap.page_allocator.free(message);
-        gl.glGetShaderInfoLog(v_shader_id, @bitCast(length), &length, @ptrCast(message));
-        std.debug.print("Failed to compile shader 1: \n{s}\n", .{message});
-    }
-    gl.glCompileShader(f_shader_id);
-
-    compileResult = 0;
-    gl.glGetShaderiv(f_shader_id, gl.GL_COMPILE_STATUS, &compileResult);
-    if (compileResult == gl.GL_FALSE) {
-        var length: i32 = 0;
-        gl.glGetShaderiv(f_shader_id, gl.GL_INFO_LOG_LENGTH, &length);
-        const message = try std.heap.page_allocator.alloc(u8, @intCast(@abs(length)));
-        defer std.heap.page_allocator.free(message);
-        gl.glGetShaderInfoLog(f_shader_id, @bitCast(length), &length, @ptrCast(message));
-        std.debug.print("Failed to compile shader 2: \n{s}\n", .{message});
-    }
-
-    const shader_program = gl.glCreateProgram();
-
-    gl.glAttachShader(shader_program, v_shader_id);
-    gl.glAttachShader(shader_program, f_shader_id);
-
-    gl.glLinkProgram(shader_program);
-    gl.glValidateProgram(shader_program);
+    const shader_program = try createProgram(v_shader_id, f_shader_id);
+    defer gl.glDeleteProgram(shader_program);
 
     const positions: [16]f32 = [_]f32{
         -1.0, -1.0,  0.0,  0.0,
@@ -120,29 +87,30 @@ pub fn testWindow(bitmap: bmp.Bitmap) !void {
         0, 1, 2, 2, 3, 0
     };
 
-    var vao: u32 = 0;
-    gl.glGenVertexArrays(1, &vao);
-    gl.glBindVertexArray(vao);
 
+    // Corners of the square occupying all window
     var buffer: u32 = 0;
     gl.glGenBuffers(1, &buffer);
     gl.glBindBuffer(gl.GL_ARRAY_BUFFER, buffer);
     gl.glBufferData(gl.GL_ARRAY_BUFFER, positions.len * @sizeOf(f32), &positions, gl.GL_STATIC_DRAW);
 
+    // Indices of the corner positions to draw
     var index_buffer: u32 = 0;
     gl.glGenBuffers(1, &index_buffer);
     gl.glBindBuffer(gl.GL_ELEMENT_ARRAY_BUFFER, index_buffer);
     gl.glBufferData(gl.GL_ELEMENT_ARRAY_BUFFER, indices.len * @sizeOf(u32), &indices, gl.GL_STATIC_DRAW);
-   
+  
+    // First attribute of the vertex shader (vec2 position)
     gl.glEnableVertexAttribArray(0);
     gl.glVertexAttribPointer(0, 2, gl.GL_FLOAT, gl.GL_FALSE, 4 * @sizeOf(f32), @ptrFromInt(0));
+
+    // Second attribute of the vertex shader (vec2 tex_Coord)
     gl.glEnableVertexAttribArray(1);
     gl.glVertexAttribPointer(1, 2, gl.GL_FLOAT, gl.GL_FALSE, 4 * @sizeOf(f32), @ptrFromInt(8));
 
     gl.glUseProgram(shader_program);
 
     const sampler_loc = gl.glGetUniformLocation(shader_program, "u_Texture");
-    std.debug.print("{}!\n", .{sampler_loc});
     gl.glUniform1i(sampler_loc, 0);
 
     while(glfw.glfwWindowShouldClose(window) == 0) {
@@ -152,6 +120,113 @@ pub fn testWindow(bitmap: bmp.Bitmap) !void {
         glfw.glfwSwapBuffers(window);
     }
 }
+
+fn createTexture() u32 {
+    var id: u32 = 0;
+    gl.glGenTextures(1, &id);
+    return id;
+}
+
+// Creates and compiles a shader of s_type given a string
+fn createShader(s_type: u32, shader: []const u8) GLError!u32 {
+    const shader_id: u32 = gl.glCreateShader(s_type);
+    gl.glShaderSource(shader_id, 1, @ptrCast(&shader), null);
+    gl.glCompileShader(shader_id);
+
+    // Check for compilation error
+    var compile_result: i32 = 0;
+    gl.glGetShaderiv(shader_id, gl.GL_COMPILE_STATUS, &compile_result);
+
+    if (compile_result == gl.GL_FALSE) {
+        var length: i32 = 0;
+        var buf: [1024]u8 = undefined;
+        var fba = std.heap.FixedBufferAllocator.init(&buf);
+        const allocator = fba.allocator();
+        gl.glGetShaderiv(shader_id, gl.GL_INFO_LOG_LENGTH, &length);
+
+        print("Failed to compile shader {}\n", .{ shader_id });
+        const message = allocator.alloc(u8, @intCast(@abs(length))) catch {
+            print("Error too long to display...\n", .{});
+            return GLError.ShaderCompilationError;
+        };
+
+        defer allocator.free(message);
+        gl.glGetShaderInfoLog(shader_id, @intCast(@abs(length)), &length, @ptrCast(message));
+
+        print("{s}\n", .{ message });
+        return GLError.ShaderCompilationError;
+    }
+    return shader_id;
+}
+
+// Creates a shader program from vertex and fragment shader, returning the program id or error
+// Initializes all Uniform variables to 0
+fn createProgram(vt_id: u32, ft_id: u32) GLError!u32 {
+    const program_id = gl.glCreateProgram();
+    if (program_id == 0)
+        return GLError.ProgramError;
+
+    gl.glAttachShader(program_id, vt_id);
+    gl.glAttachShader(program_id, ft_id);
+    gl.glLinkProgram(program_id);
+    gl.glValidateProgram(program_id);
+
+    // Check for link errors
+    var link_status: i32 = 0;
+    gl.glGetProgramiv(program_id, gl.GL_LINK_STATUS, &link_status);
+    if (link_status == gl.GL_FALSE) {
+        var length: i32 = 0;
+        var buf: [1024]u8 = undefined;
+        var fba = std.heap.FixedBufferAllocator.init(&buf);
+        const allocator = fba.allocator();
+
+        gl.glGetProgramiv(program_id, gl.GL_INFO_LOG_LENGTH, &length);
+
+        print("Shader program {} linker error:\n", .{ program_id });
+        const message = allocator.alloc(u8, @intCast(@abs(length))) catch {
+            print("Error too long to display...\n", .{});
+            return GLError.ProgramError;
+        };
+
+        gl.glGetProgramInfoLog(program_id, @intCast(@abs(length)), &length, @ptrCast(message));
+        print("{s}\n", .{ message });
+
+        return GLError.ProgramError;
+    }
+
+    // Check for validation errors
+    var validate_status: i32 = 0;
+    gl.glGetProgramiv(program_id, gl.GL_VALIDATE_STATUS, &validate_status);
+    if (validate_status == gl.GL_FALSE) {
+        var length: i32 = 0;
+        var buf: [1024]u8 = undefined;
+        var fba = std.heap.FixedBufferAllocator.init(&buf);
+        const allocator = fba.allocator();
+
+        gl.glGetProgramiv(program_id, gl.GL_INFO_LOG_LENGTH, &length);
+
+        print("Shader program {} validation error:\n", .{ program_id });
+        const message = allocator.alloc(u8, @intCast(@abs(length))) catch {
+            print("Error too long to display...\n", .{});
+            return GLError.ProgramError;
+        };
+
+        gl.glGetProgramInfoLog(program_id, @intCast(@abs(length)), &length, @ptrCast(message));
+        print("{s}\n", .{ message });
+
+        return GLError.ProgramError;
+    }
+
+    return program_id;
+}
+
+const GLError = error {
+    ShaderCompilationError,
+    ProgramError,
+    WindowCreationError,
+    GLInitializationError,
+    GLFWInitializationError
+};
 
 
 const vt_shader =
