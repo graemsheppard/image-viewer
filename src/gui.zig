@@ -43,8 +43,8 @@ pub fn createWindow(_: std.mem.Allocator, bitmap: bmp.Bitmap) GLError!void {
     gl.glActiveTexture(gl.GL_TEXTURE0);
     gl.glBindTexture(gl.GL_TEXTURE_2D, texture_id);
 
-    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_S, gl.GL_REPEAT);
-    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_T, gl.GL_REPEAT);
+    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_S, gl.GL_CLAMP_TO_BORDER);
+    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_T, gl.GL_CLAMP_TO_BORDER);
     gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR);
     gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR);
 
@@ -114,10 +114,9 @@ pub fn createWindow(_: std.mem.Allocator, bitmap: bmp.Bitmap) GLError!void {
     gl.glUniform1i(sampler_loc, 0);
 
     while(glfw.glfwWindowShouldClose(window) == 0) {
-        gl.glClear(gl.GL_COLOR_BUFFER_BIT);
         gl.glDrawElements(gl.GL_TRIANGLES, indices.len, gl.GL_UNSIGNED_INT, null);
-        glfw.glfwWaitEvents();
         glfw.glfwSwapBuffers(window);
+        glfw.glfwWaitEvents();
     }
 }
 
@@ -227,7 +226,6 @@ const GLError = error {
     GLInitializationError,
     GLFWInitializationError
 };
-
 
 const vt_shader =
 \\  #version 330 core
