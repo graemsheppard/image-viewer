@@ -9,7 +9,7 @@ const bmp = @import("bitmap.zig");
 const print = std.debug.print;
 pub const Window = glfw.GLFWwindow;
 
-// Initialize our window with the correct size
+/// Initialize our window with the correct size
 pub fn createWindow(_: std.mem.Allocator, bitmap: bmp.Bitmap) GLError!void {
     if (glfw.glfwInit() == 0) {
         return GLError.GLFWInitializationError;
@@ -127,7 +127,7 @@ fn createTexture() u32 {
     return id;
 }
 
-// Creates and compiles a shader of s_type given a string
+/// Creates and compiles a shader of s_type given a string
 fn createShader(s_type: u32, shader: []const u8) GLError!u32 {
     const shader_id: u32 = gl.glCreateShader(s_type);
     gl.glShaderSource(shader_id, 1, @ptrCast(&shader), null);
@@ -159,8 +159,8 @@ fn createShader(s_type: u32, shader: []const u8) GLError!u32 {
     return shader_id;
 }
 
-// Creates a shader program from vertex and fragment shader, returning the program id or error
-// Initializes all Uniform variables to 0
+/// Creates a shader program from vertex and fragment shader, returning the program id or error
+/// Initializes all Uniform variables to 0
 fn createProgram(vt_id: u32, ft_id: u32) GLError!u32 {
     const program_id = gl.glCreateProgram();
     if (program_id == 0)
