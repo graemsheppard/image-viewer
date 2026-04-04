@@ -22,8 +22,8 @@ pub fn createWindow(_: std.mem.Allocator, bitmap: bmp.Bitmap) GLError!void {
     glfw.glfwWindowHint(glfw.GLFW_OPENGL_FORWARD_COMPAT, glfw.GL_TRUE);
     glfw.glfwWindowHint(glfw.GLFW_RESIZABLE, glfw.GL_TRUE);
 
-    const window = glfw.glfwCreateWindow(256, 256, @ptrCast(bitmap.file_name), null, null);
-    
+    const dimensions = bitmap.dib_header.getDimensions();
+    const window = glfw.glfwCreateWindow(dimensions.x, dimensions.y, @ptrCast(bitmap.file_name), null, null);
     if (window == null) {
         return GLError.WindowCreationError;
     }
@@ -43,12 +43,11 @@ pub fn createWindow(_: std.mem.Allocator, bitmap: bmp.Bitmap) GLError!void {
     gl.glActiveTexture(gl.GL_TEXTURE0);
     gl.glBindTexture(gl.GL_TEXTURE_2D, texture_id);
 
-    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_S, gl.GL_CLAMP_TO_BORDER);
+    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_S, gl.GL_REPEAT);
     gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_T, gl.GL_CLAMP_TO_BORDER);
     gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR);
     gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR);
 
-    const dimensions = bitmap.dib_header.getDimensions();
     gl.glTexImage2D(
         gl.GL_TEXTURE_2D,
         0,
@@ -76,6 +75,7 @@ pub fn createWindow(_: std.mem.Allocator, bitmap: bmp.Bitmap) GLError!void {
     const shader_program = try createProgram(v_shader_id, f_shader_id);
     defer gl.glDeleteProgram(shader_program);
 
+    // The four corners of the square and corresponding UV coords
     const positions: [16]f32 = [_]f32{
         -1.0, -1.0,  0.0,  0.0,
         -1.0,  1.0,  0.0,  1.0,
@@ -83,6 +83,7 @@ pub fn createWindow(_: std.mem.Allocator, bitmap: bmp.Bitmap) GLError!void {
          1.0, -1.0,  1.0,  0.0
     };
 
+    // Order the above array should be processed (2 triangles)
     const indices: [6]u32 = [_]u32{
         0, 1, 2, 2, 3, 0
     };
@@ -110,14 +111,42 @@ pub fn createWindow(_: std.mem.Allocator, bitmap: bmp.Bitmap) GLError!void {
 
     gl.glUseProgram(shader_program);
 
+    // Initialize uniformas
     const sampler_loc = gl.glGetUniformLocation(shader_program, "u_Texture");
     gl.glUniform1i(sampler_loc, 0);
 
+    const size_loc = gl.glGetUniformLocation(shader_program , "u_WindowSize");
+    gl.glUniform2i(size_loc, dimensions.x, dimensions.y);
+
+    // Set state so we can pull this data in the resize callback
+    var window_state: WindowState = .{
+        .shader_program = shader_program,
+        .num_indices = indices.len
+    };
+
+    // Handle resizing
+    glfw.glfwSetWindowUserPointer(window, &window_state);
+    _ = glfw.glfwSetFramebufferSizeCallback(window, resizeCallback);
+
+    // Draw when changes are detected
     while(glfw.glfwWindowShouldClose(window) == 0) {
+        gl.glClear(gl.GL_COLOR_BUFFER_BIT);
         gl.glDrawElements(gl.GL_TRIANGLES, indices.len, gl.GL_UNSIGNED_INT, null);
         glfw.glfwSwapBuffers(window);
         glfw.glfwWaitEvents();
     }
+}
+
+// Calls draw while window is being resized
+fn resizeCallback(window: ?*glfw.GLFWwindow, w: i32, h: i32) callconv(.c) void {
+    const raw_ptr = glfw.glfwGetWindowUserPointer(window);
+    const window_state: *WindowState = @ptrCast(@alignCast(raw_ptr));
+    gl.glViewport(0, 0, w, h);
+    const size_loc = gl.glGetUniformLocation(window_state.shader_program , "u_WindowSize");
+    gl.glUniform2i(size_loc, w, h);
+    gl.glClear(gl.GL_COLOR_BUFFER_BIT);
+    gl.glDrawElements(gl.GL_TRIANGLES, @intCast(window_state.num_indices), gl.GL_UNSIGNED_INT, null);
+    glfw.glfwSwapBuffers(window);
 }
 
 fn createTexture() u32 {
@@ -219,6 +248,12 @@ fn createProgram(vt_id: u32, ft_id: u32) GLError!u32 {
     return program_id;
 }
 
+// Stores any data that might need to be retrieved outside of the main function
+const WindowState = struct {
+    shader_program: u32,
+    num_indices: u32
+};
+
 const GLError = error {
     ShaderCompilationError,
     ProgramError,
@@ -229,11 +264,14 @@ const GLError = error {
 
 const vt_shader =
 \\  #version 330 core
+\\  uniform ivec2 u_WindowSize;
 \\  layout (location = 0) in vec2 position;
 \\  layout (location = 1) in vec2 texCoord;
 \\  out vec2 v_TexCoord;
 \\  void main() {
-\\      gl_Position = vec4(position, 0.0, 1.0);
+\\      float minDim = min(float(u_WindowSize.x), float(u_WindowSize.y));
+\\      vec2 scale = vec2(float(u_WindowSize.x) / minDim, float(u_WindowSize.y) / minDim);
+\\      gl_Position = vec4(position.x / scale.x, position.y / scale.y, 0.0, 1.0);
 \\      v_TexCoord = texCoord;
 \\  }
 ;
