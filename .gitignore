@@ -1,4 +1,7 @@
 zig-out
 *.bmp
+*.png
+*.jpg
+*.jpeg
 .DS_Store
 .zig-cache

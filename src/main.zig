@@ -1,9 +1,11 @@
 const std = @import("std");
 const bmp = @import("bitmap.zig");
 const gui = @import("gui.zig");
-const FileFormatError = bmp.FileFormatError;
+const util = @import("util.zig");
+const png = @import("png.zig");
 const Bitmap = bmp.Bitmap;
-const bytesToUsize = @import("util.zig").bytesToUsize;
+const FileType = util.FileType;
+const FileFormatError = util.FileFormatError;
 const print = std.debug.print;
 
 pub fn main() void {
@@ -25,21 +27,32 @@ pub fn main() void {
         std.process.exit(1);
     };
 
-    const info = Bitmap.parse(file_name, data) catch |err| {
-        switch (err) {
-            FileFormatError.UnsupportedFormat => print("File is not in a supported format.\n", .{}),
-            FileFormatError.InvalidFileHeader => print("The file header is not valid.\n", .{}),
-            FileFormatError.InvalidDIBHeader => print("The DIB header is not valid.\n", .{}),
-        }
-        std.process.exit(2);
-    };
-
-    info.print();
-
-    gui.createWindow(allocator, info) catch |err| {
-        print("Could not draw to screen. {}\n", .{err});
+    const file_type = util.getFileType(file_name) catch {
+        print("Unsupported file type\n", .{});
         std.process.exit(1);
     };
+
+    if (file_type == FileType.png) {
+        _ = png.PNG.parse(file_name, data) catch {
+            std.process.exit(1);
+        };
+    }
+
+    if (file_type == FileType.bitmap) {
+        const info = Bitmap.parse(file_name, data) catch |err| {
+            switch (err) {
+                FileFormatError.UnsupportedFormat => print("File is not in a supported format.\n", .{}),
+                FileFormatError.InvalidFileHeader => print("The file header is not valid.\n", .{}),
+                FileFormatError.InvalidDIBHeader => print("The DIB header is not valid.\n", .{}),
+            }
+            std.process.exit(2);
+        };
+
+        gui.createWindow(allocator, info) catch |err| {
+            print("Could not draw to screen. {}\n", .{err});
+            std.process.exit(1);
+        };
+    }
 
     std.process.exit(0);
 }

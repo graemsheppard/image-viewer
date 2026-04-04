@@ -1,5 +1,6 @@
 const std = @import("std");
-const bytesToUsize = @import("util.zig").bytesToUsize;
+const FileFormatError = @import("util.zig").FileFormatError;
+const bytesToUsizeLittle = @import("util.zig").bytesToUsizeLittle;
 
 pub const Bitmap = struct {
     file_name: []const u8,
@@ -12,10 +13,10 @@ pub const Bitmap = struct {
         if (data.len < 14) return FileFormatError.InvalidFileHeader;
         
         // Handle the headers and their variations
-        const file_header= try BitmapFileHeader.parse(data);
+        const file_header = try BitmapFileHeader.parse(data);
 
         // The u16 size at offset 14 is enough to identify the DIB header format
-        const dib_size = bytesToUsize(data[14..18], u32) catch 0;
+        const dib_size = bytesToUsizeLittle(data[14..18], u32) catch 0;
         const dib_type = if (std.enums.fromInt(DIBHeaderSize, dib_size )) |val| val else return FileFormatError.InvalidDIBHeader;
         const dib_header: DIBHeader = switch(dib_type ) {
             .bitmap_info_header => .{ .bitmap_info_header = try BitmapInfoHeader.parse(data) },
@@ -72,12 +73,12 @@ pub const BitmapFileHeader = struct {
     offset: u32,
 
     fn parse(data: []u8) FileFormatError!BitmapFileHeader {
-        const signature = bytesToUsize(data[0..2], u16) catch 0;
+        const signature = bytesToUsizeLittle(data[0..2], u16) catch 0;
 
         if (signature != 0x4d42) return FileFormatError.UnsupportedFormat;
 
-        const fileSize = bytesToUsize(data[2..6], u32) catch 0;
-        const offset = bytesToUsize(data[10..14], u32) catch 0;
+        const fileSize = bytesToUsizeLittle(data[2..6], u32) catch 0;
+        const offset = bytesToUsizeLittle(data[10..14], u32) catch 0;
 
         const result: BitmapFileHeader = .{
             .offset = offset,
@@ -135,10 +136,10 @@ const BitmapCoreHeader = struct {
     bpp: u16,
 
     fn parse(data: []u8) FileFormatError!BitmapCoreHeader {
-        const width = bytesToUsize(data[18..20], u16) catch 0;
-        const height = bytesToUsize(data[20..22], u16) catch 0;
-        const planes = bytesToUsize(data[22..24], u16) catch 0;
-        const bpp = bytesToUsize(data[24..26], u16) catch 0;
+        const width = bytesToUsizeLittle(data[18..20], u16) catch 0;
+        const height = bytesToUsizeLittle(data[20..22], u16) catch 0;
+        const planes = bytesToUsizeLittle(data[22..24], u16) catch 0;
+        const bpp = bytesToUsizeLittle(data[24..26], u16) catch 0;
 
         return .{
             .size = 40,
@@ -159,11 +160,11 @@ const BitmapInfoHeader = struct {
     compression: u32,
 
     fn parse(data: []u8) FileFormatError!BitmapInfoHeader {
-        const width = bytesToUsize(data[18..22], i32) catch 0;
-        const height = bytesToUsize(data[22..26], i32) catch 0;
-        const planes = bytesToUsize(data[26..28], u16) catch 0;
-        const bpp = bytesToUsize(data[28..30], u16) catch 0;
-        const compression = bytesToUsize(data[30..34], u32) catch 0;
+        const width = bytesToUsizeLittle(data[18..22], i32) catch 0;
+        const height = bytesToUsizeLittle(data[22..26], i32) catch 0;
+        const planes = bytesToUsizeLittle(data[26..28], u16) catch 0;
+        const bpp = bytesToUsizeLittle(data[28..30], u16) catch 0;
+        const compression = bytesToUsizeLittle(data[30..34], u32) catch 0;
 
         return .{
             .size = 40,
@@ -176,8 +177,3 @@ const BitmapInfoHeader = struct {
     }
 };
 
-pub const FileFormatError = error {
-    InvalidFileHeader,
-    InvalidDIBHeader,
-    UnsupportedFormat
-};
