@@ -34,7 +34,8 @@ pub fn main() void {
             FileFormatError.UnsupportedFormat => print("File is not in a supported format.\n", .{}),
             FileFormatError.InvalidFileHeader => print("The file header is not valid.\n", .{}),
             FileFormatError.InvalidDIBHeader => print("The DIB header is not valid.\n", .{}),
-            FileFormatError.MalformedChunk => print("The file contained an invalid chunk.\n", .{})
+            FileFormatError.MalformedChunk => print("The file contained an invalid chunk.\n", .{}),
+            FileFormatError.MissingField => print("The file is missing required data.\n", .{})
         }
         std.process.exit(2);
     };

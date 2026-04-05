@@ -55,5 +55,6 @@ pub const FileFormatError = error {
     InvalidFileHeader,
     InvalidDIBHeader,
     UnsupportedFormat,
-    MalformedChunk
+    MalformedChunk,
+    MissingField
 };
