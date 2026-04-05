@@ -1,5 +1,5 @@
 const std = @import("std");
-const FileFormatError = @import("util.zig").FileFormatError;
+const FileFormatError = @import("image.zig").FileFormatError;
 const bytesToUsizeLittle = @import("util.zig").bytesToUsizeLittle;
 
 pub const Bitmap = struct {
@@ -40,6 +40,10 @@ pub const Bitmap = struct {
         };
 
         return result;
+    }
+
+    pub fn deinit(_: Bitmap) void {
+        // TODO
     }
 
     pub fn print(self: Bitmap) void {

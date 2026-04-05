@@ -1,6 +1,4 @@
 const std = @import("std");
-const png = @import("png.zig");
-const bmp = @import("bitmap.zig");
 
 pub fn bytesToUsizeLittle(bytes: []const u8, comptime T: type) InvalidCastError!T {
     return bytesToUsize(bytes, T, .little);
@@ -42,27 +40,8 @@ pub fn bytesToUsize(bytes: []const u8, comptime T: type, comptime endianness: En
     return result;
 }
 
-pub fn getFileType(file_name: []const u8) FileFormatError!FileType {
-    var idx: ?usize = null;
-    const bmp_type = ".bmp";
-    const png_type = ".png";
-    idx = std.mem.lastIndexOf(u8, file_name, bmp_type);
-    if (idx != null)
-        return .bitmap;
-    idx = std.mem.lastIndexOf(u8, file_name, png_type);
-    if (idx != null)
-        return .png;
-    return FileFormatError.UnsupportedFormat;
-}
-
 pub const InvalidCastError = error {
     SizeMismatch
-};
-
-pub const FileFormatError = error {
-    InvalidFileHeader,
-    InvalidDIBHeader,
-    UnsupportedFormat
 };
 
 pub const Endianness = enum {
@@ -70,19 +49,3 @@ pub const Endianness = enum {
     big
 };
 
-pub const ImageFile = union(FileType) {
-    png: png.PNG,
-    bitmap: bmp.Bitmap,
-
-    pub fn getFileType(self: ImageFile) FileType {
-        return switch(self) {
-            .png => FileType.png,
-            .bitmap => FileType.bitmap
-        };
-    }
-};
-
-pub const FileType = enum {
-    bitmap,
-    png
-};
