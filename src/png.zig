@@ -67,12 +67,62 @@ pub const PNG = struct {
             const chunk = chunks.items[chunk_idx];
             if (!std.mem.eql(u8, chunk.name, "IDAT")) continue;
             idat_chunks[idat_idx] = IDAT.parse(chunk, data_chunks, idat_idx);
+            idat_chunks[idat_idx].print();
             idat_idx += 1;
         }
 
-        std.debug.print("{x}\n", .{ idat_chunks[0].data[0..4] });
+        std.debug.print("IDAT Chunks: {}\nData: {x}\n", .{ idat_chunks.len, idat_chunks[0].data[0..8] });
         var stream = IDATStream.init(allocator, idat_chunks) catch return FileFormatError.MalformedChunk;
         defer stream.deinit();
+
+        var buf: u16 = 0;
+        var bits_read = stream.readBits(3, &buf);
+        
+        // Each block starts with 3-bit header
+        while (bits_read > 0) : (bits_read = stream.readBits(3, &buf)) {
+            const bfinal = buf & 0x1;
+
+            const btype_val = @as(u2, @intCast((buf >> 1) & 0b11));
+            const btype: BTYPE = @enumFromInt(btype_val);
+
+            if (btype == .no_compression) {
+                stream.seekByte();
+                _ = stream.readBits(16, &buf);
+                
+            } else if (btype == .compressed_fixed) {
+
+            } else if (btype == .compressed_dynamic) {
+                const symbol_tbl = [_]u8 { 16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15 };
+                var code_len_tbl = [_]u8 { 0 } ** 19;
+                // Code lengths for literal/length alphabet
+                _ = stream.readBits(5, &buf);
+                const hlit = buf + 257;
+                // Code lengths for distance alphabet
+                _ = stream.readBits(5, &buf);
+                const hdist = buf + 1;
+                // Code lengths for the code length alphabet (?)
+                _ = stream.readBits(4, &buf);
+                const hclen = buf + 4;
+
+                // Read 3 bits HCLEN times to fill out the lengths table
+                var hcen_idx: usize = 0;
+                while (hcen_idx < hclen and hcen_idx < symbol_tbl.len) : (hcen_idx += 1) {
+                    _ = stream.readBits(3, &buf);
+                    code_len_tbl[symbol_tbl[hcen_idx]] = @intCast(buf);
+                }
+
+                std.debug.print("HLIT: {}\nHDIST: {}\nHCEN: {}\n", .{ hlit, hdist, hclen });
+                for (symbol_tbl, 0..) |sym, s_idx| {
+                    std.debug.print("[{}]: ({}) -> {}\n", .{ s_idx, symbol_tbl[s_idx], code_len_tbl[sym] });
+                }
+
+            } else {
+                break;
+            }
+            std.debug.print("{}, {}\n", .{ bfinal, btype });
+            // if (bfinal > 0) break;
+            break;
+        }
 
         return .{
             .file_name = file_name,
@@ -86,6 +136,13 @@ pub const PNG = struct {
     pub fn deinit(self: PNG) void {
         self.chunks.deinit();
     }
+};
+
+const BTYPE = enum(u2) {
+    no_compression = 0,
+    compressed_fixed = 1,
+    compressed_dynamic = 2,
+    reserved = 3
 };
 
 /// Helper for reading data bitwise
@@ -140,6 +197,17 @@ const IDATStream = struct {
         return bits_read;
     }
 
+    /// If the reader is not currently byte-aligned, moves forward to the start of the next byte, otherwise does nothing
+    pub fn seekByte(self: *IDATStream) void {
+        if (self.bit_idx % 8 == 0) return;
+        self.bit_idx = 0;
+        self.byte_idx += 1;
+        if (self.byte_idx >= self.data[self.data_idx].len) {
+            self.byte_idx = 0;
+            self.data_idx += 1;
+        }
+    }
+
     pub fn deinit(self: IDATStream) void {
         self.allocator.free(self.data);
     }
@@ -176,7 +244,7 @@ pub const IDAT = struct {
     }
 
     pub fn print(self: IDAT) void {
-        std.debug.print("CM: {?}\nCINFO: {?}\nLength: {}\n", .{ self.cm, self.cinfo, self.data.len });
+        std.debug.print("CM: {?}\nCINFO: {?}\nLength: {}\nData: {x}...\n", .{ self.cm, self.cinfo, self.data.len, self.data[0..4] });
     }
 };
 

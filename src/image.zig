@@ -57,5 +57,6 @@ pub const FileFormatError = error {
     UnsupportedFormat,
     UnsupportedCompressionMethod,
     MalformedChunk,
-    MissingField
+    MissingField,
+    CorruptedData
 };
