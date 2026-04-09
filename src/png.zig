@@ -75,45 +75,46 @@ pub const PNG = struct {
         var stream = IDATStream.init(allocator, idat_chunks) catch return FileFormatError.MalformedChunk;
         defer stream.deinit();
 
-        var buf: u16 = 0;
-        var bits_read = stream.readBits(3, &buf);
+        var bits_read: u5 = 0;
+        var block_header = stream.readBits(3, &bits_read);
         
         // Each block starts with 3-bit header
-        while (bits_read > 0) : (bits_read = stream.readBits(3, &buf)) {
-            const bfinal = buf & 0x1;
+        while (bits_read > 0) : (block_header = stream.readBits(3, &bits_read)) {
+            const bfinal = block_header & 0x1;
 
-            const btype_val = @as(u2, @intCast((buf >> 1) & 0b11));
+            const btype_val = @as(u2, @intCast((block_header >> 1) & 0b11));
             const btype: BTYPE = @enumFromInt(btype_val);
 
             if (btype == .no_compression) {
                 stream.seekByte();
-                _ = stream.readBits(16, &buf);
+                _ = stream.readBits(16, null);
                 
             } else if (btype == .compressed_fixed) {
 
             } else if (btype == .compressed_dynamic) {
                 const symbol_tbl = [_]u8 { 16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15 };
                 var code_len_tbl = [_]u8 { 0 } ** 19;
-                // Code lengths for literal/length alphabet
-                _ = stream.readBits(5, &buf);
-                const hlit = buf + 257;
-                // Code lengths for distance alphabet
-                _ = stream.readBits(5, &buf);
-                const hdist = buf + 1;
+                
+                // Code lengths for literal/length and distance
+                const hlit = stream.readBits(5, null) + 257;
+                const hdist = stream.readBits(5, null) + 1;
+
                 // Code lengths for the code length alphabet (?)
-                _ = stream.readBits(4, &buf);
-                const hclen = buf + 4;
+                const hclen = stream.readBits(4, null) + 4;
 
                 // Read 3 bits HCLEN times to fill out the lengths table
-                var hcen_idx: usize = 0;
-                while (hcen_idx < hclen and hcen_idx < symbol_tbl.len) : (hcen_idx += 1) {
-                    _ = stream.readBits(3, &buf);
-                    code_len_tbl[symbol_tbl[hcen_idx]] = @intCast(buf);
+                var hclen_idx: usize = 0;
+                while (hclen_idx < hclen and hclen_idx < symbol_tbl.len) : (hclen_idx += 1) {
+                    const sym_len = stream.readBits(3, null);
+                    code_len_tbl[symbol_tbl[hclen_idx]] = @intCast(sym_len);
                 }
 
+                const codes = allocator.alloc(u7, hclen) catch return FileFormatError.MalformedChunk;
+                defer allocator.free(codes);
+
                 std.debug.print("HLIT: {}\nHDIST: {}\nHCEN: {}\n", .{ hlit, hdist, hclen });
-                for (symbol_tbl, 0..) |sym, s_idx| {
-                    std.debug.print("[{}]: ({}) -> {}\n", .{ s_idx, symbol_tbl[s_idx], code_len_tbl[sym] });
+                for (symbol_tbl) |sym| {
+                    std.debug.print("[{}]: {}\n", .{ sym, code_len_tbl[sym] });
                 }
 
             } else {
@@ -171,18 +172,18 @@ const IDATStream = struct {
     }
 
     /// Reads count bits from the stream and assigns the result to result, returns number of bits actually read
-    pub fn readBits(self: *IDATStream, count: usize, result: *u16) u5 {
+    pub fn readBits(self: *IDATStream, count: usize, bits_read: ?*u5) u16 {
         var counter: isize = @intCast(count - 1);
         var value: u16 = 0;
-        var bits_read: u5 = 0;
+        var _bits_read: u5 = 0;
         while (counter >= 0 and self.data_idx < self.data.len) : (counter -= 1) {
             const mask: u16 = 0x0001;
             var cur = self.data[self.data_idx][self.byte_idx];
             cur >>= @intCast(self.bit_idx);
-            const bit = (cur & mask) << @intCast(bits_read);
+            const bit = (cur & mask) << @intCast(_bits_read);
             value |= bit;
 
-            bits_read += 1;
+            _bits_read += 1;
             self.bit_idx += 1;
             if (self.bit_idx == 8) {
                 self.bit_idx = 0;
@@ -193,8 +194,8 @@ const IDATStream = struct {
                 self.data_idx += 1;
             }
         }
-        result.* = value;
-        return bits_read;
+        if (bits_read) |br| br.* = _bits_read;
+        return value;
     }
 
     /// If the reader is not currently byte-aligned, moves forward to the start of the next byte, otherwise does nothing
