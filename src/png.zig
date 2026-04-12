@@ -109,14 +109,114 @@ pub const PNG = struct {
                     code_len_tbl[symbol_tbl[hclen_idx]] = @intCast(sym_len);
                 }
 
-                const codes = allocator.alloc(u7, hclen) catch return FileFormatError.MalformedChunk;
-                defer allocator.free(codes);
-
-                std.debug.print("HLIT: {}\nHDIST: {}\nHCEN: {}\n", .{ hlit, hdist, hclen });
-                for (symbol_tbl) |sym| {
-                    std.debug.print("[{}]: {}\n", .{ sym, code_len_tbl[sym] });
+                // The number of times each length appears
+                var bl_counts = [_]u4 { 0 } ** 16;
+                for (code_len_tbl) |len| {
+                    if (len > 0) bl_counts[len] += 1;
                 }
 
+                // Generates the first code for each code length
+                var base_codes = [_]u16 { 0 } ** 16;
+                var code: u16 = 0;
+                for (1..16) |bits| {
+                    code = (code + bl_counts[bits - 1]) << 1;
+                    base_codes[bits] = code;
+                }
+
+                var tree_codes = allocator.alloc(u16, 19) catch return FileFormatError.MalformedChunk;
+                @memset(tree_codes, 0);
+                defer allocator.free(tree_codes);
+
+                // Assigns the huffman code for each symbol
+                for (code_len_tbl, 0..) |cl, cl_idx| {
+                    if (cl == 0) continue;
+                    tree_codes[cl_idx] = base_codes[cl];
+                    base_codes[cl] += 1;
+                }
+
+                for (tree_codes, 0..) |tc, sym| {
+                    if (tc == 0) continue;
+                    std.debug.print("[{}]: {b}\n", .{ sym, tc });
+                }
+
+                const num_lengths = hdist + hlit;
+                var all_lengths = allocator.alloc(u4, num_lengths) catch return FileFormatError.InvalidHuffmanCode;
+                defer allocator.free(all_lengths);
+
+                var cur: u16 = 0;
+                var bit_len: u5 = 0;
+                var symbols_decoded: u9 = 0;
+
+                while (symbols_decoded < (hdist + hlit)) {
+                    stream.readBit(&cur);
+                    bit_len += 1;
+                    if (bit_len > 15) return FileFormatError.InvalidHuffmanCode;
+
+                    // Check if the current bits are matched in the tree
+                    var code_found: u5 = 0;
+                    var matched = false;
+                    for (tree_codes, 0..) |tc, sym| {
+                        if (code_len_tbl[sym] == 0) continue;
+                        if (bit_len == code_len_tbl[sym] and tc == cur) {
+                            code_found = @intCast(sym);
+                            matched = true;
+                            break;
+                        }
+                    }
+
+                    if (!matched) continue;
+
+                    if (code_found <= 15) {
+                        all_lengths[symbols_decoded] = @intCast(code_found);
+                        symbols_decoded += 1;
+                    }
+                    // Handle repeat codes (16-18)
+                    else if (code_found == 16) {
+                        // Repeat previous length n times
+                        if (symbols_decoded == 0) return FileFormatError.InvalidHuffmanCode;
+                        const repeat = stream.readBits(2, null) + 3;
+                        const val = all_lengths[symbols_decoded - 1];
+                        for (0..repeat) |_| {
+                            all_lengths[symbols_decoded] = val;
+                            symbols_decoded += 1;
+                        }
+                    } else if (code_found == 17) {
+                        // Repeat 0 n times
+                        const repeat = stream.readBits(3, null) + 3;
+                        for (0..repeat) |_| {
+                            all_lengths[symbols_decoded] = 0;
+                            symbols_decoded += 1;
+                        }
+                    } else if (code_found == 18) {
+                        // Repeat 0 n times
+                        const repeat = stream.readBits(7, null) + 11;
+                        for (0..repeat) |_| {
+                            all_lengths[symbols_decoded] = 0;
+                            symbols_decoded += 1;
+                        }
+                    }
+
+                    // Reset state
+                    cur = 0;
+                    bit_len = 0;
+                }
+
+                const literal_lengths = all_lengths[0..286];
+                const distance_lengths = all_lengths[286..];
+
+                const literal_codes = try generateCodes(allocator, literal_lengths);
+                defer allocator.free(literal_codes);
+
+                const distance_codes = try generateCodes(allocator, distance_lengths);
+                defer allocator.free(distance_codes);
+
+                for (distance_codes, 0..) |lc, lc_idx| {
+                    std.debug.print("[{}]: {b}\n", .{ lc_idx, lc });
+                }
+
+                std.debug.print("symbols_decoded: {}\n", .{ symbols_decoded });
+
+                std.debug.print("HLIT: {}\nHDIST: {}\nHCEN: {}\n", .{ hlit, hdist, hclen });
             } else {
                 break;
             }
@@ -132,6 +232,33 @@ pub const PNG = struct {
             .plte = plte,
             .chunks = chunks
         };
+    }
+
+    /// Given an array of lengths, returns an array of equal size of codes. Caller owns the memory.
+    fn generateCodes(allocator: Allocator, lengths: []u4) FileFormatError![]u16 {
+        var codes = allocator.alloc(u16, lengths.len) catch return FileFormatError.InvalidHuffmanCode;
+        @memset(codes, 0);
+
+        // Count occurrences of each length
+        var bl_counts: [16]u8 = [_]u8 { 0 } ** 16;
+        for (lengths) |length| bl_counts[length] += 1;
+
+        // Generates the first code for each code length
+        var base_codes = [_]u16 { 0 } ** 16;
+        var base_code: u16 = 0;
+        for (1..16) |bits| {
+            base_code = (base_code + bl_counts[bits - 1]) << 1;
+            base_codes[bits] = base_code;
+        }
+
+        // Assigns the huffman code for each symbol
+        for (lengths, 0..) |length, length_idx| {
+            if (length == 0) continue;
+            codes[length_idx] = base_codes[length];
+            base_codes[length] += 1;
+        }
+
+        return codes;
     }
 
     pub fn deinit(self: PNG) void {
@@ -169,6 +296,16 @@ const IDATStream = struct {
             .byte_idx = 0,
             .data_idx = 0
         };
+    }
+
+    /// Reads a single bit into the destination, shifting the destination left
+    pub fn readBit(self: *IDATStream, destination: *u16) void {
+        var bits_read: u5 = 0;
+        const bit = self.readBits(1, &bits_read);
+        if (bits_read == 0) return;
+
+        destination.* <<= 1;
+        destination.* |= (bit & 0x1);
     }
 
     /// Reads count bits from the stream and assigns the result to result, returns number of bits actually read
