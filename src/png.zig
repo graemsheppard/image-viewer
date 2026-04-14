@@ -11,6 +11,7 @@ pub const PNG = struct {
     ihdr: IHDR,
     plte: ?PLTE,
     chunks: ArrayList(Chunk),
+    bytes_per_row: u32,
 
     pub fn parse(allocator: Allocator, file_name: []const u8, data: []u8) FileFormatError!PNG {
         // Validate 8-byte file signature
@@ -27,6 +28,10 @@ pub const PNG = struct {
             return FileFormatError.MalformedChunk;
 
         const ihdr = try IHDR.parse(ihdr_chunk);
+        const bpp = ihdr.getBitsPerPixel();
+        const bytes_per_row = (bpp * ihdr.width + 7) / 8;
+        const total_size = (bytes_per_row + 1) * ihdr.height;
+
         const plte_required = ihdr.color_type == 3;
 
         var idx: usize = 33;
@@ -93,13 +98,11 @@ pub const PNG = struct {
 
             } else if (btype == .compressed_dynamic) {
                 const symbol_tbl = [_]u8 { 16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15 };
-                var code_len_tbl = [_]u8 { 0 } ** 19;
+                var code_len_tbl = [_]u4 { 0 } ** 19;
                 
-                // Code lengths for literal/length and distance
+                // Code lengths for literal/length, distance, and code length alphabets
                 const hlit = stream.readBits(5, null) + 257;
                 const hdist = stream.readBits(5, null) + 1;
-
-                // Code lengths for the code length alphabet (?)
                 const hclen = stream.readBits(4, null) + 4;
 
                 // Read 3 bits HCLEN times to fill out the lengths table
@@ -109,30 +112,8 @@ pub const PNG = struct {
                     code_len_tbl[symbol_tbl[hclen_idx]] = @intCast(sym_len);
                 }
 
-                // The number of times each length appears
-                var bl_counts = [_]u4 { 0 } ** 16;
-                for (code_len_tbl) |len| {
-                    if (len > 0) bl_counts[len] += 1;
-                }
-
-                // Generates the first code for each code length
-                var base_codes = [_]u16 { 0 } ** 16;
-                var code: u16 = 0;
-                for (1..16) |bits| {
-                    code = (code + bl_counts[bits - 1]) << 1;
-                    base_codes[bits] = code;
-                }
-
-                var tree_codes = allocator.alloc(u16, 19) catch return FileFormatError.MalformedChunk;
-                @memset(tree_codes, 0);
+                const tree_codes = try generateCodes(allocator, &code_len_tbl);
                 defer allocator.free(tree_codes);
-
-                // Assigns the huffman code for each symbol
-                for (code_len_tbl, 0..) |cl, cl_idx| {
-                    if (cl == 0) continue;
-                    tree_codes[cl_idx] = base_codes[cl];
-                    base_codes[cl] += 1;
-                }
 
                 for (tree_codes, 0..) |tc, sym| {
                     if (tc == 0) continue;
@@ -209,12 +190,55 @@ pub const PNG = struct {
 
                 const distance_codes = try generateCodes(allocator, distance_lengths);
                 defer allocator.free(distance_codes);
+                
+                const output_buffer = allocator.alloc(u8, total_size) catch return FileFormatError.InvalidHuffmanCode;
+                defer allocator.free(output_buffer);
 
-                for (distance_codes, 0..) |lc, lc_idx| {
-                    std.debug.print("[{}]: {b}\n", .{ lc_idx, lc });
+                cur = 0;
+                bit_len = 0;
+                var output_idx: usize = 0;
+                while (true) {
+                    stream.readBit(&cur);
+                    bit_len += 1;
+
+                    if (bit_len > 15) return FileFormatError.InvalidHuffmanCode;
+
+                    var lit: ?u16 = null;
+                    for (literal_codes, 0..) |lc, lc_idx| {
+                        if (literal_lengths[lc_idx] == bit_len and lc == cur) {
+                           lit = @intCast(lc_idx);
+                        }
+                    }
+
+                    const lit_symbol = lit orelse continue;
+
+                    cur = 0;
+                    bit_len = 0;
+                    switch(lit_symbol) {
+                        0...255 => {
+                            const byte: u8 = @intCast(lit_symbol);
+                            output_buffer[output_idx] = byte;
+                            output_idx += 1;
+                        },
+                        256 => {
+                            std.debug.print("EOB\n", .{});
+                            break;
+                        },
+                        257...285 => {
+                            const len_info = length_info_tbl[lit_symbol - 257];
+                            const extra_lengths = if (len_info.extra_bits > 0) stream.readBits(len_info.extra_bits, null) else 0;
+                            const lengths = len_info.base + extra_lengths;
+
+                            var dis: ?u16 = null;
+                            for (distance_codes, 0..) |dc, dc_idx| {
+                                // todo
+                            }
+                        },
+                        else => unreachable
+                    }
                 }
 
-                std.debug.print("symbols_decoded: {}\n", .{ symbols_decoded });
+                std.debug.print("w: {}\nh: {}\nbd: {}\nbpp:{}\nct: {}\n", .{ ihdr.width, ihdr.height, ihdr.bit_depth, bytes_per_row, ihdr.color_type });
 
                 std.debug.print("HLIT: {}\nHDIST: {}\nHCEN: {}\n", .{ hlit, hdist, hclen });
             } else {
@@ -230,7 +254,8 @@ pub const PNG = struct {
             .allocator = allocator,
             .ihdr = ihdr,
             .plte = plte,
-            .chunks = chunks
+            .chunks = chunks,
+            .bytes_per_row = bytes_per_row
         };
     }
 
@@ -240,14 +265,16 @@ pub const PNG = struct {
         @memset(codes, 0);
 
         // Count occurrences of each length
-        var bl_counts: [16]u8 = [_]u8 { 0 } ** 16;
-        for (lengths) |length| bl_counts[length] += 1;
+        var length_counts: [16]u9 = [_]u9 { 0 } ** 16;
+        for (lengths) |length| {
+            if (length > 0) length_counts[length] += 1;
+        }
 
         // Generates the first code for each code length
         var base_codes = [_]u16 { 0 } ** 16;
         var base_code: u16 = 0;
         for (1..16) |bits| {
-            base_code = (base_code + bl_counts[bits - 1]) << 1;
+            base_code = (base_code + length_counts[bits - 1]) << 1;
             base_codes[bits] = base_code;
         }
 
@@ -264,6 +291,76 @@ pub const PNG = struct {
     pub fn deinit(self: PNG) void {
         self.chunks.deinit();
     }
+};
+
+const CodeInfo = struct {
+    base: u16,
+    extra_bits: u4
+};
+
+const length_info_tbl: [29]CodeInfo = [_]CodeInfo {
+    .{ .base = 3,   .extra_bits = 0 },
+    .{ .base = 4,   .extra_bits = 0 },
+    .{ .base = 5,   .extra_bits = 0 },
+    .{ .base = 6,   .extra_bits = 0 },
+    .{ .base = 7,   .extra_bits = 0 },
+    .{ .base = 8,   .extra_bits = 0 },
+    .{ .base = 9,   .extra_bits = 0 },
+    .{ .base = 10,  .extra_bits = 0 },
+    .{ .base = 11,  .extra_bits = 1 },
+    .{ .base = 13,  .extra_bits = 1 },
+    .{ .base = 15,  .extra_bits = 1 },
+    .{ .base = 17,  .extra_bits = 1 },
+    .{ .base = 19,  .extra_bits = 2 },
+    .{ .base = 23,  .extra_bits = 2 },
+    .{ .base = 27,  .extra_bits = 2 },
+    .{ .base = 31,  .extra_bits = 2 },
+    .{ .base = 35,  .extra_bits = 3 },
+    .{ .base = 43,  .extra_bits = 3 },
+    .{ .base = 51,  .extra_bits = 3 },
+    .{ .base = 59,  .extra_bits = 3 },
+    .{ .base = 67,  .extra_bits = 4 },
+    .{ .base = 83,  .extra_bits = 4 },
+    .{ .base = 99,  .extra_bits = 4 },
+    .{ .base = 115, .extra_bits = 4 },
+    .{ .base = 131, .extra_bits = 5 },
+    .{ .base = 163, .extra_bits = 5 },
+    .{ .base = 195, .extra_bits = 5 },
+    .{ .base = 227, .extra_bits = 5 },
+    .{ .base = 258, .extra_bits = 0 }
+};
+
+const distance_info_tbl: [30]CodeInfo = [_]CodeInfo {
+    .{ .base = 1,     .extra_bits = 0 },
+    .{ .base = 2,     .extra_bits = 0 },
+    .{ .base = 3,     .extra_bits = 0 },
+    .{ .base = 4,     .extra_bits = 0 },
+    .{ .base = 5,     .extra_bits = 1 },
+    .{ .base = 7,     .extra_bits = 1 },
+    .{ .base = 9,     .extra_bits = 2 },
+    .{ .base = 13,    .extra_bits = 2 },
+    .{ .base = 17,    .extra_bits = 3 },
+    .{ .base = 25,    .extra_bits = 3 },
+    .{ .base = 33,    .extra_bits = 4 },
+    .{ .base = 49,    .extra_bits = 4 },
+    .{ .base = 65,    .extra_bits = 5 },
+    .{ .base = 97,    .extra_bits = 5 },
+    .{ .base = 129,   .extra_bits = 6 },
+    .{ .base = 193,   .extra_bits = 6 },
+    .{ .base = 257,   .extra_bits = 7 },
+    .{ .base = 385,   .extra_bits = 7 },
+    .{ .base = 513,   .extra_bits = 8 },
+    .{ .base = 769,   .extra_bits = 8 },
+    .{ .base = 1025,  .extra_bits = 9 },
+    .{ .base = 1537,  .extra_bits = 9 },
+    .{ .base = 2049,  .extra_bits = 10 },
+    .{ .base = 3073,  .extra_bits = 10 },
+    .{ .base = 4097,  .extra_bits = 11 },
+    .{ .base = 6145,  .extra_bits = 11 },
+    .{ .base = 8193,  .extra_bits = 12 },
+    .{ .base = 12289, .extra_bits = 12 },
+    .{ .base = 16385, .extra_bits = 13 },
+    .{ .base = 24577, .extra_bits = 13 }
 };
 
 const BTYPE = enum(u2) {
@@ -418,6 +515,16 @@ pub const IHDR = struct {
             .compression_method = compression_method, 
             .filter_method = chunk.data[11],
             .interlace_method = chunk.data[12]
+        };
+    }
+
+    fn getBitsPerPixel(self: IHDR) u8 {
+        return switch(self.color_type) {
+            0, 3 => self.bit_depth,     // Grayscale, Indexed(Palette)
+            2 => self.bit_depth * 3,    // RGB
+            4 => self.bit_depth * 2,    // Grayscale w/ alpha
+            5 => self.bit_depth * 4,     // RGBA
+            else => unreachable
         };
     }
 
