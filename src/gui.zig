@@ -5,12 +5,12 @@ const glfw = @cImport({
 const gl = @cImport({
     @cInclude("glad/glad.h");
 });
-const bmp = @import("bitmap.zig");
+const img = @import("image.zig");
 const print = std.debug.print;
 pub const Window = glfw.GLFWwindow;
 
 /// Initialize our window with the correct size
-pub fn createWindow(_: std.mem.Allocator, bitmap: bmp.Bitmap) GLError!void {
+pub fn createWindow(_: std.mem.Allocator, image: img.ImageFile) GLError!void {
     if (glfw.glfwInit() == 0) {
         return GLError.GLFWInitializationError;
     }
@@ -22,8 +22,8 @@ pub fn createWindow(_: std.mem.Allocator, bitmap: bmp.Bitmap) GLError!void {
     glfw.glfwWindowHint(glfw.GLFW_OPENGL_FORWARD_COMPAT, glfw.GL_TRUE);
     glfw.glfwWindowHint(glfw.GLFW_RESIZABLE, glfw.GL_TRUE);
 
-    const dimensions = bitmap.dib_header.getDimensions();
-    const window = glfw.glfwCreateWindow(dimensions.x, dimensions.y, @ptrCast(bitmap.file_name), null, null);
+    const dimensions = image.getDimensions();
+    const window = glfw.glfwCreateWindow(dimensions.x, dimensions.y, "Hello!", null, null);
     if (window == null) {
         return GLError.WindowCreationError;
     }
@@ -37,6 +37,9 @@ pub fn createWindow(_: std.mem.Allocator, bitmap: bmp.Bitmap) GLError!void {
     }
 
     // Setup the texture with the pixel data
+    gl.glEnable(gl.GL_BLEND);
+    gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA);
+
     var texture_id = createTexture();
     defer gl.glDeleteTextures(1, &texture_id);
     
@@ -51,13 +54,13 @@ pub fn createWindow(_: std.mem.Allocator, bitmap: bmp.Bitmap) GLError!void {
     gl.glTexImage2D(
         gl.GL_TEXTURE_2D,
         0,
-        gl.GL_RGB,
+        gl.GL_RGBA,
         dimensions.x,
         dimensions.y,
         0,
-        gl.GL_BGR,
+        gl.GL_RGBA,
         gl.GL_UNSIGNED_BYTE,
-        @ptrCast(bitmap.pixels)
+        @ptrCast(image.getPixels())
     );
 
     // Initialize vertex array, required before OpenGL can draw
@@ -75,12 +78,15 @@ pub fn createWindow(_: std.mem.Allocator, bitmap: bmp.Bitmap) GLError!void {
     const shader_program = try createProgram(v_shader_id, f_shader_id);
     defer gl.glDeleteProgram(shader_program);
 
+    const top: f32 = if (image == .png) 0.0 else 1.0;
+    const bot: f32 = if (image == .png) 1.0 else 0.0;
+
     // The four corners of the square and corresponding UV coords
     const positions: [16]f32 = [_]f32{
-        -1.0, -1.0,  0.0,  0.0,
-        -1.0,  1.0,  0.0,  1.0,
-         1.0,  1.0,  1.0,  1.0,
-         1.0, -1.0,  1.0,  0.0
+        -1.0, -1.0,  0.0,  bot,
+        -1.0,  1.0,  0.0,  top,
+         1.0,  1.0,  1.0,  top,
+         1.0, -1.0,  1.0,  bot
     };
 
     // Order the above array should be processed (2 triangles)

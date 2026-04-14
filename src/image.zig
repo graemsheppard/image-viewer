@@ -16,6 +16,23 @@ pub const ImageFile = union(FileType) {
         };
     }
 
+    pub fn getDimensions(self: ImageFile) struct { x: i32, y: i32 } {
+        return switch(self) {
+            .bitmap => |b| {
+                const dimensions = b.dib_header.getDimensions();
+                return .{ .x = dimensions.x, .y = dimensions.y };
+            },
+            .png => |p| .{ .x = @intCast(p.ihdr.width), .y = @intCast(p.ihdr.height) }
+        };
+    }
+
+    pub fn getPixels(self: ImageFile) []u8 {
+        return switch(self) {
+            .bitmap => |b| b.pixels,
+            .png => |p| p.pixels
+        };
+    }
+
     pub fn parse(allocator: Allocator, file_name: []const u8, data: []u8) FileFormatError!ImageFile {
         const file_type = try parseFileType(file_name);
         return switch (file_type) {

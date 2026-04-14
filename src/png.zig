@@ -10,8 +10,10 @@ pub const PNG = struct {
     allocator: Allocator,
     ihdr: IHDR,
     plte: ?PLTE,
+    trns: ?TRNS,
     chunks: ArrayList(Chunk),
     bytes_per_row: u32,
+    pixels: []u8,
 
     pub fn parse(allocator: Allocator, file_name: []const u8, data: []u8) FileFormatError!PNG {
         // Validate 8-byte file signature
@@ -37,12 +39,15 @@ pub const PNG = struct {
         var idx: usize = 33;
         var chunk_count: usize = 0;
         var plte: ?PLTE = null;
+        var trns: ?TRNS = null;
         var reached_end = false;
         var data_chunks: usize = 0;
         while (idx < data.len) : (chunk_count += 1) {
             const chunk = Chunk.parse(idx, data);
             if (std.mem.eql(u8, chunk.name, "PLTE"))
                 plte = try PLTE.parse(chunk);
+            if (std.mem.eql(u8, chunk.name, "tRNS"))
+                trns = try TRNS.parse(chunk);
             chunks.insert(allocator, chunk_count, chunk) catch return FileFormatError.MalformedChunk;
 
             // Each chunk requires at least 12 bytes for headers and CRC
@@ -55,6 +60,8 @@ pub const PNG = struct {
                 break;
             }
         }
+
+        std.debug.print("-{}\n-{}\n", .{ plte.?.colors.len, trns.?.alphas.len });
 
         if (!reached_end)
             return FileFormatError.MissingField;
@@ -72,18 +79,21 @@ pub const PNG = struct {
             const chunk = chunks.items[chunk_idx];
             if (!std.mem.eql(u8, chunk.name, "IDAT")) continue;
             idat_chunks[idat_idx] = IDAT.parse(chunk, data_chunks, idat_idx);
-            idat_chunks[idat_idx].print();
             idat_idx += 1;
         }
 
-        std.debug.print("IDAT Chunks: {}\nData: {x}\n", .{ idat_chunks.len, idat_chunks[0].data[0..8] });
         var stream = IDATStream.init(allocator, idat_chunks) catch return FileFormatError.MalformedChunk;
         defer stream.deinit();
+
+        var output_idx: usize = 0;
+        const output_buffer = allocator.alloc(u8, total_size) catch return FileFormatError.InvalidHuffmanCode;
+        @memset(output_buffer, 0);
+        defer allocator.free(output_buffer);
 
         var bits_read: u5 = 0;
         var block_header = stream.readBits(3, &bits_read);
         
-        // Each block starts with 3-bit header
+        // Process the zlib stream, each block starts with 3-bit header
         while (bits_read > 0) : (block_header = stream.readBits(3, &bits_read)) {
             const bfinal = block_header & 0x1;
 
@@ -115,44 +125,21 @@ pub const PNG = struct {
                 const tree_codes = try generateCodes(allocator, &code_len_tbl);
                 defer allocator.free(tree_codes);
 
-                for (tree_codes, 0..) |tc, sym| {
-                    if (tc == 0) continue;
-                    std.debug.print("[{}]: {b}\n", .{ sym, tc });
-                }
-
                 const num_lengths = hdist + hlit;
                 var all_lengths = allocator.alloc(u4, num_lengths) catch return FileFormatError.InvalidHuffmanCode;
                 defer allocator.free(all_lengths);
 
-                var cur: u16 = 0;
-                var bit_len: u5 = 0;
+                // Build the huffman code lookup for the literal/length and distances
                 var symbols_decoded: u9 = 0;
-
                 while (symbols_decoded < (hdist + hlit)) {
-                    stream.readBit(&cur);
-                    bit_len += 1;
-                    if (bit_len > 15) return FileFormatError.InvalidHuffmanCode;
+                    const code_len_symbol = try stream.decodeSymbol(tree_codes, &code_len_tbl);
 
-                    // Check if the current bits are matched in the tree
-                    var code_found: u5 = 0;
-                    var matched = false;
-                    for (tree_codes, 0..) |tc, sym| {
-                        if (code_len_tbl[sym] == 0) continue;
-                        if (bit_len == code_len_tbl[sym] and tc == cur) {
-                            code_found = @intCast(sym);
-                            matched = true;
-                            break;
-                        }
-                    }
-
-                    if (!matched) continue;
-
-                    if (code_found <= 15) {
-                        all_lengths[symbols_decoded] = @intCast(code_found);
+                    if (code_len_symbol <= 15) {
+                        all_lengths[symbols_decoded] = @intCast(code_len_symbol);
                         symbols_decoded += 1;
                     }
                     // Handle repeat codes (16-18)
-                    else if (code_found == 16) {
+                    else if (code_len_symbol == 16) {
                         // Repeat previous length n times
                         if (symbols_decoded == 0) return FileFormatError.InvalidHuffmanCode;
                         const repeat = stream.readBits(2, null) + 3;
@@ -161,14 +148,14 @@ pub const PNG = struct {
                             all_lengths[symbols_decoded] = val;
                             symbols_decoded += 1;
                         }
-                    } else if (code_found == 17) {
+                    } else if (code_len_symbol == 17) {
                         // Repeat 0 n times
                         const repeat = stream.readBits(3, null) + 3;
                         for (0..repeat) |_| {
                             all_lengths[symbols_decoded] = 0;
                             symbols_decoded += 1;
                         }
-                    } else if (code_found == 18) {
+                    } else if (code_len_symbol == 18) {
                         // Repeat 0 n times
                         const repeat = stream.readBits(7, null) + 11;
                         for (0..repeat) |_| {
@@ -176,14 +163,10 @@ pub const PNG = struct {
                             symbols_decoded += 1;
                         }
                     }
-
-                    // Reset state
-                    cur = 0;
-                    bit_len = 0;
                 }
 
-                const literal_lengths = all_lengths[0..286];
-                const distance_lengths = all_lengths[286..];
+                const literal_lengths = all_lengths[0..hlit];
+                const distance_lengths = all_lengths[hlit..];
 
                 const literal_codes = try generateCodes(allocator, literal_lengths);
                 defer allocator.free(literal_codes);
@@ -191,29 +174,10 @@ pub const PNG = struct {
                 const distance_codes = try generateCodes(allocator, distance_lengths);
                 defer allocator.free(distance_codes);
                 
-                const output_buffer = allocator.alloc(u8, total_size) catch return FileFormatError.InvalidHuffmanCode;
-                defer allocator.free(output_buffer);
 
-                cur = 0;
-                bit_len = 0;
-                var output_idx: usize = 0;
+                // Use the generated literal/length and distance tables to decompress the data
                 while (true) {
-                    stream.readBit(&cur);
-                    bit_len += 1;
-
-                    if (bit_len > 15) return FileFormatError.InvalidHuffmanCode;
-
-                    var lit: ?u16 = null;
-                    for (literal_codes, 0..) |lc, lc_idx| {
-                        if (literal_lengths[lc_idx] == bit_len and lc == cur) {
-                           lit = @intCast(lc_idx);
-                        }
-                    }
-
-                    const lit_symbol = lit orelse continue;
-
-                    cur = 0;
-                    bit_len = 0;
+                    const lit_symbol = try stream.decodeSymbol(literal_codes, literal_lengths);
                     switch(lit_symbol) {
                         0...255 => {
                             const byte: u8 = @intCast(lit_symbol);
@@ -226,36 +190,64 @@ pub const PNG = struct {
                         },
                         257...285 => {
                             const len_info = length_info_tbl[lit_symbol - 257];
-                            const extra_lengths = if (len_info.extra_bits > 0) stream.readBits(len_info.extra_bits, null) else 0;
-                            const lengths = len_info.base + extra_lengths;
+                            const extra_length = if (len_info.extra_bits > 0) stream.readBits(len_info.extra_bits, null) else 0;
+                            const length = len_info.base + extra_length;
 
-                            var dis: ?u16 = null;
-                            for (distance_codes, 0..) |dc, dc_idx| {
-                                // todo
+                            const dist_symbol = try stream.decodeSymbol(distance_codes, distance_lengths);
+                            const dist_info = distance_info_tbl[dist_symbol];
+                            const extra_dist = if (dist_info.extra_bits > 0) stream.readBits(dist_info.extra_bits, null) else 0;
+                            const distance = dist_info.base + extra_dist;
+
+                            for (0..length) |_| {
+                                const back_byte = output_buffer[output_idx - distance];
+                                output_buffer[output_idx] = back_byte;
+                                output_idx += 1;
                             }
                         },
                         else => unreachable
                     }
                 }
-
-                std.debug.print("w: {}\nh: {}\nbd: {}\nbpp:{}\nct: {}\n", .{ ihdr.width, ihdr.height, ihdr.bit_depth, bytes_per_row, ihdr.color_type });
-
-                std.debug.print("HLIT: {}\nHDIST: {}\nHCEN: {}\n", .{ hlit, hdist, hclen });
             } else {
-                break;
+                return FileFormatError.UnsupportedCompressionMethod;
             }
-            std.debug.print("{}, {}\n", .{ bfinal, btype });
-            // if (bfinal > 0) break;
-            break;
+            if (bfinal > 0) break;
         }
+
+        var pixels = allocator.alloc(u8, output_buffer.len * 4) catch return FileFormatError.CorruptedData;
+        @memset(pixels, 0);
+
+        // Unfilter the pixels by scanline, each scanline could have a different filter method
+        for (0..ihdr.height) |scanline_idx| {
+            const offset = (bytes_per_row + 1) * scanline_idx;
+            const scanline = output_buffer[offset..(offset + bytes_per_row + 1)];
+            const filter_byte = scanline[0];
+            const line_data = scanline[1..];
+
+            switch(filter_byte) {
+                0 => {
+                    for (line_data, 0..) |pixel, pixel_idx| {
+                        const colors = plte.?.colors[pixel];
+                        const alpha = if (trns) |trns_chunk| trns_chunk.alphaAt(pixel) else 0xff;
+                        for (colors, 0..) |color, color_idx| {
+                            pixels[4 * (scanline_idx * ihdr.width + pixel_idx) + color_idx] = color;
+                        }
+                        pixels[4 * (scanline_idx * ihdr.width + pixel_idx) + 3] = alpha;
+                    }
+                },
+                else => unreachable
+            }
+
+        } 
 
         return .{
             .file_name = file_name,
             .allocator = allocator,
             .ihdr = ihdr,
             .plte = plte,
+            .trns = trns,
             .chunks = chunks,
-            .bytes_per_row = bytes_per_row
+            .bytes_per_row = bytes_per_row,
+            .pixels = pixels
         };
     }
 
@@ -290,6 +282,7 @@ pub const PNG = struct {
 
     pub fn deinit(self: PNG) void {
         self.chunks.deinit();
+        self.allocator.free(self.pixels);
     }
 };
 
@@ -298,70 +291,6 @@ const CodeInfo = struct {
     extra_bits: u4
 };
 
-const length_info_tbl: [29]CodeInfo = [_]CodeInfo {
-    .{ .base = 3,   .extra_bits = 0 },
-    .{ .base = 4,   .extra_bits = 0 },
-    .{ .base = 5,   .extra_bits = 0 },
-    .{ .base = 6,   .extra_bits = 0 },
-    .{ .base = 7,   .extra_bits = 0 },
-    .{ .base = 8,   .extra_bits = 0 },
-    .{ .base = 9,   .extra_bits = 0 },
-    .{ .base = 10,  .extra_bits = 0 },
-    .{ .base = 11,  .extra_bits = 1 },
-    .{ .base = 13,  .extra_bits = 1 },
-    .{ .base = 15,  .extra_bits = 1 },
-    .{ .base = 17,  .extra_bits = 1 },
-    .{ .base = 19,  .extra_bits = 2 },
-    .{ .base = 23,  .extra_bits = 2 },
-    .{ .base = 27,  .extra_bits = 2 },
-    .{ .base = 31,  .extra_bits = 2 },
-    .{ .base = 35,  .extra_bits = 3 },
-    .{ .base = 43,  .extra_bits = 3 },
-    .{ .base = 51,  .extra_bits = 3 },
-    .{ .base = 59,  .extra_bits = 3 },
-    .{ .base = 67,  .extra_bits = 4 },
-    .{ .base = 83,  .extra_bits = 4 },
-    .{ .base = 99,  .extra_bits = 4 },
-    .{ .base = 115, .extra_bits = 4 },
-    .{ .base = 131, .extra_bits = 5 },
-    .{ .base = 163, .extra_bits = 5 },
-    .{ .base = 195, .extra_bits = 5 },
-    .{ .base = 227, .extra_bits = 5 },
-    .{ .base = 258, .extra_bits = 0 }
-};
-
-const distance_info_tbl: [30]CodeInfo = [_]CodeInfo {
-    .{ .base = 1,     .extra_bits = 0 },
-    .{ .base = 2,     .extra_bits = 0 },
-    .{ .base = 3,     .extra_bits = 0 },
-    .{ .base = 4,     .extra_bits = 0 },
-    .{ .base = 5,     .extra_bits = 1 },
-    .{ .base = 7,     .extra_bits = 1 },
-    .{ .base = 9,     .extra_bits = 2 },
-    .{ .base = 13,    .extra_bits = 2 },
-    .{ .base = 17,    .extra_bits = 3 },
-    .{ .base = 25,    .extra_bits = 3 },
-    .{ .base = 33,    .extra_bits = 4 },
-    .{ .base = 49,    .extra_bits = 4 },
-    .{ .base = 65,    .extra_bits = 5 },
-    .{ .base = 97,    .extra_bits = 5 },
-    .{ .base = 129,   .extra_bits = 6 },
-    .{ .base = 193,   .extra_bits = 6 },
-    .{ .base = 257,   .extra_bits = 7 },
-    .{ .base = 385,   .extra_bits = 7 },
-    .{ .base = 513,   .extra_bits = 8 },
-    .{ .base = 769,   .extra_bits = 8 },
-    .{ .base = 1025,  .extra_bits = 9 },
-    .{ .base = 1537,  .extra_bits = 9 },
-    .{ .base = 2049,  .extra_bits = 10 },
-    .{ .base = 3073,  .extra_bits = 10 },
-    .{ .base = 4097,  .extra_bits = 11 },
-    .{ .base = 6145,  .extra_bits = 11 },
-    .{ .base = 8193,  .extra_bits = 12 },
-    .{ .base = 12289, .extra_bits = 12 },
-    .{ .base = 16385, .extra_bits = 13 },
-    .{ .base = 24577, .extra_bits = 13 }
-};
 
 const BTYPE = enum(u2) {
     no_compression = 0,
@@ -443,6 +372,24 @@ const IDATStream = struct {
         }
     }
 
+    /// Decodes the next symbol in the stream given a code table and length table indexed by the symbol, advancing the stream
+    pub fn decodeSymbol(self: *IDATStream, code_tbl: []u16, length_tbl: []u4) FileFormatError!u16 {
+        var bit_len: u8 = 0;
+        var cur: u16 = 0;
+        while(true) {
+            self.readBit(&cur);
+            bit_len += 1;
+
+            if (bit_len > 15) return FileFormatError.InvalidHuffmanCode;
+
+            for (code_tbl, 0..) |code, symbol| {
+                if (length_tbl[symbol] == bit_len and code == cur) {
+                    return @intCast(symbol);
+                }
+            }
+        }
+    }
+
     pub fn deinit(self: IDATStream) void {
         self.allocator.free(self.data);
     }
@@ -476,10 +423,6 @@ pub const IDAT = struct {
             .cinfo = cinfo,
             .data = data
         };
-    }
-
-    pub fn print(self: IDAT) void {
-        std.debug.print("CM: {?}\nCINFO: {?}\nLength: {}\nData: {x}...\n", .{ self.cm, self.cinfo, self.data.len, self.data[0..4] });
     }
 };
 
@@ -553,11 +496,21 @@ pub const PLTE = struct {
             .colors = colors
         };
     }
+};
 
-    pub fn print(self: PLTE) void {
-        for (self.colors, 0..) |color, idx| {
-            std.debug.print("{:0>3}: {x:0>2}{x:0>2}{x:0>2}\n", .{ idx, color[0], color[1], color[2] });
-        }
+/// Stores the alpha for each pallette index as a byte.
+pub const TRNS = struct {
+    alphas: []const u8,
+
+    pub fn parse(chunk: Chunk) FileFormatError!TRNS {
+        return .{
+            .alphas = chunk.data
+        };
+    }
+
+    /// Alphas is not guaranteed to have 256 entries so this should be used.
+    pub fn alphaAt(self: TRNS, idx: usize) u8 {
+        return if (idx >= self.alphas.len) 0xff else self.alphas[idx];
     }
 };
 
@@ -579,4 +532,71 @@ const Chunk = struct {
             .crc = crc
         };
     }
+};
+
+/// Indexed by length symbol, base is the base length and extra bits is how many to read and add onto base. [RFC-1951]
+const length_info_tbl: [29]CodeInfo = [_]CodeInfo {
+    .{ .base = 3,   .extra_bits = 0 },
+    .{ .base = 4,   .extra_bits = 0 },
+    .{ .base = 5,   .extra_bits = 0 },
+    .{ .base = 6,   .extra_bits = 0 },
+    .{ .base = 7,   .extra_bits = 0 },
+    .{ .base = 8,   .extra_bits = 0 },
+    .{ .base = 9,   .extra_bits = 0 },
+    .{ .base = 10,  .extra_bits = 0 },
+    .{ .base = 11,  .extra_bits = 1 },
+    .{ .base = 13,  .extra_bits = 1 },
+    .{ .base = 15,  .extra_bits = 1 },
+    .{ .base = 17,  .extra_bits = 1 },
+    .{ .base = 19,  .extra_bits = 2 },
+    .{ .base = 23,  .extra_bits = 2 },
+    .{ .base = 27,  .extra_bits = 2 },
+    .{ .base = 31,  .extra_bits = 2 },
+    .{ .base = 35,  .extra_bits = 3 },
+    .{ .base = 43,  .extra_bits = 3 },
+    .{ .base = 51,  .extra_bits = 3 },
+    .{ .base = 59,  .extra_bits = 3 },
+    .{ .base = 67,  .extra_bits = 4 },
+    .{ .base = 83,  .extra_bits = 4 },
+    .{ .base = 99,  .extra_bits = 4 },
+    .{ .base = 115, .extra_bits = 4 },
+    .{ .base = 131, .extra_bits = 5 },
+    .{ .base = 163, .extra_bits = 5 },
+    .{ .base = 195, .extra_bits = 5 },
+    .{ .base = 227, .extra_bits = 5 },
+    .{ .base = 258, .extra_bits = 0 }
+};
+
+/// Indexed by distance symbol, base is the base distance and extra bits is how many to read and add onto base. [RFC-1951]
+const distance_info_tbl: [30]CodeInfo = [_]CodeInfo {
+    .{ .base = 1,     .extra_bits = 0 },
+    .{ .base = 2,     .extra_bits = 0 },
+    .{ .base = 3,     .extra_bits = 0 },
+    .{ .base = 4,     .extra_bits = 0 },
+    .{ .base = 5,     .extra_bits = 1 },
+    .{ .base = 7,     .extra_bits = 1 },
+    .{ .base = 9,     .extra_bits = 2 },
+    .{ .base = 13,    .extra_bits = 2 },
+    .{ .base = 17,    .extra_bits = 3 },
+    .{ .base = 25,    .extra_bits = 3 },
+    .{ .base = 33,    .extra_bits = 4 },
+    .{ .base = 49,    .extra_bits = 4 },
+    .{ .base = 65,    .extra_bits = 5 },
+    .{ .base = 97,    .extra_bits = 5 },
+    .{ .base = 129,   .extra_bits = 6 },
+    .{ .base = 193,   .extra_bits = 6 },
+    .{ .base = 257,   .extra_bits = 7 },
+    .{ .base = 385,   .extra_bits = 7 },
+    .{ .base = 513,   .extra_bits = 8 },
+    .{ .base = 769,   .extra_bits = 8 },
+    .{ .base = 1025,  .extra_bits = 9 },
+    .{ .base = 1537,  .extra_bits = 9 },
+    .{ .base = 2049,  .extra_bits = 10 },
+    .{ .base = 3073,  .extra_bits = 10 },
+    .{ .base = 4097,  .extra_bits = 11 },
+    .{ .base = 6145,  .extra_bits = 11 },
+    .{ .base = 8193,  .extra_bits = 12 },
+    .{ .base = 12289, .extra_bits = 12 },
+    .{ .base = 16385, .extra_bits = 13 },
+    .{ .base = 24577, .extra_bits = 13 }
 };

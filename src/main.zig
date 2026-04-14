@@ -30,16 +30,16 @@ pub fn main() void {
     };
 
     const image = ImageFile.parse(allocator, file_name, data) catch |err| {
-        print("A file format error was encountere: {}\n", . { err });
+        print("A file format error was encountered: {}\n", . { err });
         std.process.exit(@intCast(@intFromError(err)));
     };
 
     defer image.deinit();
 
-//    gui.createWindow(allocator, image.bitmap) catch |err| {
-//        print("Could not draw to screen. {}\n", .{err});
-//        std.process.exit(1);
-//    };
+    gui.createWindow(allocator, image) catch |err| {
+        print("Could not draw to screen. {}\n", .{err});
+        std.process.exit(1);
+    };
 
     std.process.exit(0);
 }
