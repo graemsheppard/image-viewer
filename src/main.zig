@@ -29,10 +29,12 @@ pub fn main() void {
         std.process.exit(1);
     };
 
+    var timer: ?std.time.Timer = std.time.Timer.start() catch null;
     const image = ImageFile.parse(allocator, file_name, data) catch |err| {
         print("A file format error was encountered: {}\n", . { err });
         std.process.exit(@intCast(@intFromError(err)));
     };
+    std.debug.print("Processed in: {}ms\n", .{ timer.?.read() / 1_000_000 });
 
     defer image.deinit();
 

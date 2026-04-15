@@ -61,8 +61,6 @@ pub const PNG = struct {
             }
         }
 
-        std.debug.print("-{}\n-{}\n", .{ plte.?.colors.len, trns.?.alphas.len });
-
         if (!reached_end)
             return FileFormatError.MissingField;
 
@@ -90,128 +88,8 @@ pub const PNG = struct {
         @memset(output_buffer, 0);
         defer allocator.free(output_buffer);
 
-        var bits_read: u5 = 0;
-        var block_header = stream.readBits(3, &bits_read);
-        
-        // Process the zlib stream, each block starts with 3-bit header
-        while (bits_read > 0) : (block_header = stream.readBits(3, &bits_read)) {
-            const bfinal = block_header & 0x1;
-
-            const btype_val = @as(u2, @intCast((block_header >> 1) & 0b11));
-            const btype: BTYPE = @enumFromInt(btype_val);
-
-            if (btype == .no_compression) {
-                stream.seekByte();
-                _ = stream.readBits(16, null);
-                
-            } else if (btype == .compressed_fixed) {
-
-            } else if (btype == .compressed_dynamic) {
-                const symbol_tbl = [_]u8 { 16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15 };
-                var code_len_tbl = [_]u4 { 0 } ** 19;
-                
-                // Code lengths for literal/length, distance, and code length alphabets
-                const hlit = stream.readBits(5, null) + 257;
-                const hdist = stream.readBits(5, null) + 1;
-                const hclen = stream.readBits(4, null) + 4;
-
-                // Read 3 bits HCLEN times to fill out the lengths table
-                var hclen_idx: usize = 0;
-                while (hclen_idx < hclen and hclen_idx < symbol_tbl.len) : (hclen_idx += 1) {
-                    const sym_len = stream.readBits(3, null);
-                    code_len_tbl[symbol_tbl[hclen_idx]] = @intCast(sym_len);
-                }
-
-                const tree_codes = try generateCodes(allocator, &code_len_tbl);
-                defer allocator.free(tree_codes);
-
-                const num_lengths = hdist + hlit;
-                var all_lengths = allocator.alloc(u4, num_lengths) catch return FileFormatError.InvalidHuffmanCode;
-                defer allocator.free(all_lengths);
-
-                // Build the huffman code lookup for the literal/length and distances
-                var symbols_decoded: u9 = 0;
-                while (symbols_decoded < (hdist + hlit)) {
-                    const code_len_symbol = try stream.decodeSymbol(tree_codes, &code_len_tbl);
-
-                    if (code_len_symbol <= 15) {
-                        all_lengths[symbols_decoded] = @intCast(code_len_symbol);
-                        symbols_decoded += 1;
-                    }
-                    // Handle repeat codes (16-18)
-                    else if (code_len_symbol == 16) {
-                        // Repeat previous length n times
-                        if (symbols_decoded == 0) return FileFormatError.InvalidHuffmanCode;
-                        const repeat = stream.readBits(2, null) + 3;
-                        const val = all_lengths[symbols_decoded - 1];
-                        for (0..repeat) |_| {
-                            all_lengths[symbols_decoded] = val;
-                            symbols_decoded += 1;
-                        }
-                    } else if (code_len_symbol == 17) {
-                        // Repeat 0 n times
-                        const repeat = stream.readBits(3, null) + 3;
-                        for (0..repeat) |_| {
-                            all_lengths[symbols_decoded] = 0;
-                            symbols_decoded += 1;
-                        }
-                    } else if (code_len_symbol == 18) {
-                        // Repeat 0 n times
-                        const repeat = stream.readBits(7, null) + 11;
-                        for (0..repeat) |_| {
-                            all_lengths[symbols_decoded] = 0;
-                            symbols_decoded += 1;
-                        }
-                    }
-                }
-
-                const literal_lengths = all_lengths[0..hlit];
-                const distance_lengths = all_lengths[hlit..];
-
-                const literal_codes = try generateCodes(allocator, literal_lengths);
-                defer allocator.free(literal_codes);
-
-                const distance_codes = try generateCodes(allocator, distance_lengths);
-                defer allocator.free(distance_codes);
-                
-
-                // Use the generated literal/length and distance tables to decompress the data
-                while (true) {
-                    const lit_symbol = try stream.decodeSymbol(literal_codes, literal_lengths);
-                    switch(lit_symbol) {
-                        0...255 => {
-                            const byte: u8 = @intCast(lit_symbol);
-                            output_buffer[output_idx] = byte;
-                            output_idx += 1;
-                        },
-                        256 => {
-                            std.debug.print("EOB\n", .{});
-                            break;
-                        },
-                        257...285 => {
-                            const len_info = length_info_tbl[lit_symbol - 257];
-                            const extra_length = if (len_info.extra_bits > 0) stream.readBits(len_info.extra_bits, null) else 0;
-                            const length = len_info.base + extra_length;
-
-                            const dist_symbol = try stream.decodeSymbol(distance_codes, distance_lengths);
-                            const dist_info = distance_info_tbl[dist_symbol];
-                            const extra_dist = if (dist_info.extra_bits > 0) stream.readBits(dist_info.extra_bits, null) else 0;
-                            const distance = dist_info.base + extra_dist;
-
-                            for (0..length) |_| {
-                                const back_byte = output_buffer[output_idx - distance];
-                                output_buffer[output_idx] = back_byte;
-                                output_idx += 1;
-                            }
-                        },
-                        else => unreachable
-                    }
-                }
-            } else {
-                return FileFormatError.UnsupportedCompressionMethod;
-            }
-            if (bfinal > 0) break;
-        }
+        // Process the zlib stream 1 block at a time, each block starts with 3-bit header
+        while (try parseBlock(allocator, &stream, output_buffer, &output_idx)) {}
 
         var pixels = allocator.alloc(u8, output_buffer.len * 4) catch return FileFormatError.CorruptedData;
         @memset(pixels, 0);
@@ -251,6 +129,141 @@ pub const PNG = struct {
         };
     }
 
+    /// Parses a block from the stream, storing the partial result in the buffer. Assumes we are at the strat of the block including header
+    /// Returns true if there are more blocks following this one.
+    fn parseBlock(allocator: Allocator, stream: *IDATStream, output_buffer: []u8, output_idx: *usize) FileFormatError!bool {
+        var bits_read: u5 = 0;
+        const block_header = stream.readBits(3, &bits_read);
+        
+        if (bits_read < 3) return FileFormatError.CorruptedData;
+
+        const bfinal = block_header & 0x1;
+        const btype_val = @as(u2, @intCast((block_header >> 1) & 0b11));
+        const btype: BTYPE = @enumFromInt(btype_val);
+
+        switch(btype) { 
+            .no_compression => try parseBlockUncompressed(stream, output_buffer, output_idx),
+            .compressed_fixed => try parseBlockCompressedFixed(allocator, stream, output_buffer, output_idx),
+            .compressed_dynamic => try parseBlockCompressedDynamic(allocator, stream, output_buffer, output_idx),
+            .reserved => return FileFormatError.UnsupportedCompressionMethod
+        }
+        
+        return bfinal == 0;
+    }
+
+    /// TODO: Parses a zlib format block from the stream where the bytes are the literal values
+    fn parseBlockUncompressed(stream: *IDATStream, _: []u8, _: *usize) FileFormatError!void {
+        stream.seekByte();
+    }
+
+    /// TODO: Parses a zlib format block from the stream with the predefined huffman codes
+    fn parseBlockCompressedFixed(_: Allocator, _: *IDATStream, _: []u8, _: *usize) FileFormatError!void {
+
+    }
+
+    /// Parses a zlib format block from the stream that uses dynamic huffman codes
+    fn parseBlockCompressedDynamic(allocator: Allocator, stream: *IDATStream, output_buffer: []u8, output_idx: *usize) FileFormatError!void {
+        const symbol_tbl = [_]u8 { 16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15 };
+        var code_len_tbl = [_]u4 { 0 } ** 19;
+        
+        // Code lengths for literal/length, distance, and code length alphabets
+        const hlit = stream.readBits(5, null) + 257;
+        const hdist = stream.readBits(5, null) + 1;
+        const hclen = stream.readBits(4, null) + 4;
+
+        // Read 3 bits HCLEN times to fill out the lengths table
+        var hclen_idx: usize = 0;
+        while (hclen_idx < hclen and hclen_idx < symbol_tbl.len) : (hclen_idx += 1) {
+            const sym_len = stream.readBits(3, null);
+            code_len_tbl[symbol_tbl[hclen_idx]] = @intCast(sym_len);
+        }
+
+        const tree_codes = try generateCodes(allocator, &code_len_tbl);
+        defer allocator.free(tree_codes);
+
+        const num_lengths = hdist + hlit;
+        var all_lengths = allocator.alloc(u4, num_lengths) catch return FileFormatError.InvalidHuffmanCode;
+        defer allocator.free(all_lengths);
+
+        // Build the huffman code lookup for the literal/length and distances
+        var symbols_decoded: u9 = 0;
+        while (symbols_decoded < (hdist + hlit)) {
+            const code_len_symbol = try decodeSymbol(stream, tree_codes, &code_len_tbl);
+
+            if (code_len_symbol <= 15) {
+                all_lengths[symbols_decoded] = @intCast(code_len_symbol);
+                symbols_decoded += 1;
+            }
+            // Handle repeat codes (16-18)
+            else if (code_len_symbol == 16) {
+                // Repeat previous length n times
+                if (symbols_decoded == 0) return FileFormatError.InvalidHuffmanCode;
+                const repeat = stream.readBits(2, null) + 3;
+                const val = all_lengths[symbols_decoded - 1];
+                for (0..repeat) |_| {
+                    all_lengths[symbols_decoded] = val;
+                    symbols_decoded += 1;
+                }
+            } else if (code_len_symbol == 17) {
+                // Repeat 0 n times
+                const repeat = stream.readBits(3, null) + 3;
+                for (0..repeat) |_| {
+                    all_lengths[symbols_decoded] = 0;
+                    symbols_decoded += 1;
+                }
+            } else if (code_len_symbol == 18) {
+                // Repeat 0 n times
+                const repeat = stream.readBits(7, null) + 11;
+                for (0..repeat) |_| {
+                    all_lengths[symbols_decoded] = 0;
+                    symbols_decoded += 1;
+                }
+            }
+        }
+
+        const literal_lengths = all_lengths[0..hlit];
+        const distance_lengths = all_lengths[hlit..];
+
+        const literal_codes = try generateCodes(allocator, literal_lengths);
+        defer allocator.free(literal_codes);
+
+        const distance_codes = try generateCodes(allocator, distance_lengths);
+        defer allocator.free(distance_codes);
+
+        // Use the generated literal/length and distance tables to decompress the data
+        while (true) {
+            const lit_symbol = try decodeSymbol(stream, literal_codes, literal_lengths);
+            switch(lit_symbol) {
+                // A literal byte, add it to the output
+                0...255 => {
+                    const byte: u8 = @intCast(lit_symbol);
+                    output_buffer[output_idx.*] = byte;
+                    output_idx.* += 1;
+                },
+                // Signifies end of block
+                256 => break,
+                // A length of bytes to copy which must be followed by a distance of bytes to look back
+                257...285 => {
+                    const len_info = length_info_tbl[lit_symbol - 257];
+                    const extra_length = if (len_info.extra_bits > 0) stream.readBits(len_info.extra_bits, null) else 0;
+                    const length = len_info.base + extra_length;
+
+                    const dist_symbol = try decodeSymbol(stream, distance_codes, distance_lengths);
+                    const dist_info = distance_info_tbl[dist_symbol];
+                    const extra_dist = if (dist_info.extra_bits > 0) stream.readBits(dist_info.extra_bits, null) else 0;
+                    const distance = dist_info.base + extra_dist;
+
+                    for (0..length) |_| {
+                        const back_byte = output_buffer[output_idx.* - distance];
+                        output_buffer[output_idx.*] = back_byte;
+                        output_idx.* += 1;
+                    }
+                },
+                else => return FileFormatError.CorruptedData
+            }
+        }
+    }
+
     /// Given an array of lengths, returns an array of equal size of codes. Caller owns the memory.
     fn generateCodes(allocator: Allocator, lengths: []u4) FileFormatError![]u16 {
         var codes = allocator.alloc(u16, lengths.len) catch return FileFormatError.InvalidHuffmanCode;
@@ -278,6 +291,24 @@ pub const PNG = struct {
         }
 
         return codes;
+    }
+
+    /// Decodes the next symbol in the stream given a code table and length table indexed by the symbol, advancing the stream
+    pub fn decodeSymbol(stream: *IDATStream, code_tbl: []u16, length_tbl: []u4) FileFormatError!u16 {
+        var bit_len: u8 = 0;
+        var cur: u16 = 0;
+        while(true) {
+            stream.readBit(&cur);
+            bit_len += 1;
+
+            if (bit_len > 15) return FileFormatError.InvalidHuffmanCode;
+
+            for (code_tbl, 0..) |code, symbol| {
+                if (length_tbl[symbol] == bit_len and code == cur) {
+                    return @intCast(symbol);
+                }
+            }
+        }
     }
 
     pub fn deinit(self: PNG) void {
@@ -369,24 +400,6 @@ const IDATStream = struct {
         if (self.byte_idx >= self.data[self.data_idx].len) {
             self.byte_idx = 0;
             self.data_idx += 1;
-        }
-    }
-
-    /// Decodes the next symbol in the stream given a code table and length table indexed by the symbol, advancing the stream
-    pub fn decodeSymbol(self: *IDATStream, code_tbl: []u16, length_tbl: []u4) FileFormatError!u16 {
-        var bit_len: u8 = 0;
-        var cur: u16 = 0;
-        while(true) {
-            self.readBit(&cur);
-            bit_len += 1;
-
-            if (bit_len > 15) return FileFormatError.InvalidHuffmanCode;
-
-            for (code_tbl, 0..) |code, symbol| {
-                if (length_tbl[symbol] == bit_len and code == cur) {
-                    return @intCast(symbol);
-                }
-            }
         }
     }
 
