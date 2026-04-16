@@ -22,7 +22,7 @@ pub const PNG = struct {
         if (signature != 0x504E47) return FileFormatError.InvalidFileHeader;
 
         var chunks = ArrayList(Chunk).initCapacity(allocator, 3) catch return FileFormatError.InvalidFileHeader;
-
+        _ = fixed_codes;
         // IHDR chunk must come first and have data of 13-bytes
         const ihdr_chunk = Chunk.parse(8, data);
 
@@ -151,14 +151,21 @@ pub const PNG = struct {
         return bfinal == 0;
     }
 
-    /// TODO: Parses a zlib format block from the stream where the bytes are the literal values
-    fn parseBlockUncompressed(stream: *IDATStream, _: []u8, _: *usize) FileFormatError!void {
-        stream.seekByte();
+    /// Parses a zlib format block from the stream where the bytes are the literal values, first 4 bytes are for length and its compliment
+    fn parseBlockUncompressed(stream: *IDATStream, output_buffer: []u8, output_idx: *usize) FileFormatError!void {
+        var len_buf: [4]u8 = undefined;
+        try stream.readBytes(&len_buf);
+        const len = bytesToUsizeBig(len_buf[0..2], u16) catch return FileFormatError.CorruptedData;
+        const output_target: []u8 = output_buffer[output_idx.*..(output_idx.* + len)];
+        try stream.readBytes(output_target);
     }
 
-    /// TODO: Parses a zlib format block from the stream with the predefined huffman codes
-    fn parseBlockCompressedFixed(_: Allocator, _: *IDATStream, _: []u8, _: *usize) FileFormatError!void {
-
+    /// Parses a zlib format block from the stream with the predefined huffman codes
+    fn parseBlockCompressedFixed(_: Allocator, stream: *IDATStream, output_buffer: []u8, output_idx: *usize) FileFormatError!void {
+        while (true) {
+            const lit_symbol = try decodeSymbol(stream, &fixed_codes, &fixed_code_lengths);
+            if (!try parseSymbol(stream, lit_symbol, &fixed_distances, &fixed_distance_lengths, output_buffer, output_idx)) break;
+        }
     }
 
     /// Parses a zlib format block from the stream that uses dynamic huffman codes
@@ -233,35 +240,43 @@ pub const PNG = struct {
         // Use the generated literal/length and distance tables to decompress the data
         while (true) {
             const lit_symbol = try decodeSymbol(stream, literal_codes, literal_lengths);
-            switch(lit_symbol) {
-                // A literal byte, add it to the output
-                0...255 => {
-                    const byte: u8 = @intCast(lit_symbol);
-                    output_buffer[output_idx.*] = byte;
-                    output_idx.* += 1;
-                },
-                // Signifies end of block
-                256 => break,
-                // A length of bytes to copy which must be followed by a distance of bytes to look back
-                257...285 => {
-                    const len_info = length_info_tbl[lit_symbol - 257];
-                    const extra_length = if (len_info.extra_bits > 0) stream.readBits(len_info.extra_bits, null) else 0;
-                    const length = len_info.base + extra_length;
-
-                    const dist_symbol = try decodeSymbol(stream, distance_codes, distance_lengths);
-                    const dist_info = distance_info_tbl[dist_symbol];
-                    const extra_dist = if (dist_info.extra_bits > 0) stream.readBits(dist_info.extra_bits, null) else 0;
-                    const distance = dist_info.base + extra_dist;
-
-                    for (0..length) |_| {
-                        const back_byte = output_buffer[output_idx.* - distance];
-                        output_buffer[output_idx.*] = back_byte;
-                        output_idx.* += 1;
-                    }
-                },
-                else => return FileFormatError.CorruptedData
-            }
+            if (!try parseSymbol(stream, lit_symbol, distance_codes, distance_lengths, output_buffer, output_idx)) break;
         }
+    }
+
+    /// Given a literal/length symbol parses it into the output buffer and the following dist symbol (if the symbol was a length).
+    /// Returns false when 256 (EOB) is reached.
+    fn parseSymbol(stream: *IDATStream, lit_symbol: u16, distance_codes: []const u16, distance_lengths: []const u4, output_buffer: []u8, output_idx: *usize) FileFormatError!bool {
+        switch(lit_symbol) {
+            // A literal byte, add it to the output
+            0...255 => {
+                const byte: u8 = @intCast(lit_symbol);
+                output_buffer[output_idx.*] = byte;
+                output_idx.* += 1;
+            },
+            // Signifies end of block
+            256 => return false,
+            // A length of bytes to copy which must be followed by a distance of bytes to look back
+            257...285 => {
+                const len_info = length_info_tbl[lit_symbol - 257];
+                const extra_length = if (len_info.extra_bits > 0) stream.readBits(len_info.extra_bits, null) else 0;
+                const length = len_info.base + extra_length;
+
+                const dist_symbol = try decodeSymbol(stream, distance_codes, distance_lengths);
+                const dist_info = distance_info_tbl[dist_symbol];
+                const extra_dist = if (dist_info.extra_bits > 0) stream.readBits(dist_info.extra_bits, null) else 0;
+                const distance = dist_info.base + extra_dist;
+
+                for (0..length) |_| {
+                    const back_byte = output_buffer[output_idx.* - distance];
+                    output_buffer[output_idx.*] = back_byte;
+                    output_idx.* += 1;
+                }
+            },
+            else => return FileFormatError.CorruptedData
+        }
+
+        return true;
     }
 
     /// Given an array of lengths, returns an array of equal size of codes. Caller owns the memory.
@@ -294,7 +309,7 @@ pub const PNG = struct {
     }
 
     /// Decodes the next symbol in the stream given a code table and length table indexed by the symbol, advancing the stream
-    pub fn decodeSymbol(stream: *IDATStream, code_tbl: []u16, length_tbl: []u4) FileFormatError!u16 {
+    pub fn decodeSymbol(stream: *IDATStream, code_tbl: []const u16, length_tbl: []const u4) FileFormatError!u16 {
         var bit_len: u8 = 0;
         var cur: u16 = 0;
         while(true) {
@@ -394,13 +409,31 @@ const IDATStream = struct {
 
     /// If the reader is not currently byte-aligned, moves forward to the start of the next byte, otherwise does nothing
     pub fn seekByte(self: *IDATStream) void {
-        if (self.bit_idx % 8 == 0) return;
+        if (self.bit_idx % 8 == 0 or self.data_idx >= self.data.len) return;
         self.bit_idx = 0;
         self.byte_idx += 1;
         if (self.byte_idx >= self.data[self.data_idx].len) {
             self.byte_idx = 0;
             self.data_idx += 1;
         }
+    }
+
+    /// Read bytes into the target slice until it is full or there is no more data in the stream. Returns error if bytes read does not match requested.
+    pub fn readBytes(self: *IDATStream, output: []u8) FileFormatError!void {
+        self.seekByte();
+        var bytes_read: usize = 0;
+        for (output, 0..) |_, idx| {
+            output[idx] = self.data[self.data_idx][self.byte_idx];
+            self.byte_idx += 1;
+            bytes_read += 1;
+            if (self.byte_idx >= self.data[self.data_idx].len) {
+                self.byte_idx = 0;
+                self.data_idx += 1;
+            }
+            if (self.data_idx >= self.data.len) break;
+        }
+        
+        if (bytes_read == output.len) return FileFormatError.CorruptedData;
     }
 
     pub fn deinit(self: IDATStream) void {
@@ -612,4 +645,35 @@ const distance_info_tbl: [30]CodeInfo = [_]CodeInfo {
     .{ .base = 12289, .extra_bits = 12 },
     .{ .base = 16385, .extra_bits = 13 },
     .{ .base = 24577, .extra_bits = 13 }
+};
+
+// Calculate fixed huffman codes and their bit lengths at comptime
+const fixed_codes = fixed_blk: {
+    var temp_codes: [288]u16 = undefined;
+    for (0..144, 0..)   |sym, idx| temp_codes[sym] = 0b00110000 + idx;
+    for (144..256, 0..) |sym, idx| temp_codes[sym] = 0b110010000 + idx;
+    for (256..280, 0..) |sym, idx| temp_codes[sym] = 0b0000000 + idx;
+    for (280..288, 0..) |sym, idx| temp_codes[sym] = 0b11000000 + idx;
+    break :fixed_blk temp_codes;
+};
+
+const fixed_code_lengths = fixed_blk: {
+    var temp_lengths: [288]u4 = undefined;
+    for (0..144)   |sym| temp_lengths[sym] = 8;
+    for (144..256) |sym| temp_lengths[sym] = 9;
+    for (256..279) |sym| temp_lengths[sym] = 7;
+    for (279..288) |sym| temp_lengths[sym] = 8;
+    break :fixed_blk temp_lengths;
+};
+
+const fixed_distances = fixed_blk: {
+    var temp_distances: [32]u16 = undefined;
+    for (0..32) |idx| temp_distances[idx] = idx;
+    break :fixed_blk temp_distances;
+};
+
+const fixed_distance_lengths = fixed_blk: {
+    var temp_lengths: [32]u4 = undefined;
+    for (0..32) |idx| temp_lengths[idx] = 5;
+    break :fixed_blk temp_lengths;
 };
