@@ -23,7 +23,8 @@ pub fn createWindow(_: std.mem.Allocator, image: img.ImageFile) GLError!void {
     glfw.glfwWindowHint(glfw.GLFW_RESIZABLE, glfw.GL_TRUE);
 
     const dimensions = image.getDimensions();
-    const window = glfw.glfwCreateWindow(dimensions.x, dimensions.y, "Hello!", null, null);
+    const file_name = image.getFileName();
+    const window = glfw.glfwCreateWindow(dimensions.x, dimensions.y, @ptrCast(file_name), null, null);
     if (window == null) {
         return GLError.WindowCreationError;
     }
@@ -51,17 +52,35 @@ pub fn createWindow(_: std.mem.Allocator, image: img.ImageFile) GLError!void {
     gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR);
     gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR);
 
-    gl.glTexImage2D(
-        gl.GL_TEXTURE_2D,
-        0,
-        gl.GL_RGBA,
-        dimensions.x,
-        dimensions.y,
-        0,
-        gl.GL_RGBA,
-        gl.GL_UNSIGNED_BYTE,
-        @ptrCast(image.getPixels())
-    );
+    // Handle different data formats
+    switch(image) {
+        .bitmap => {
+            gl.glTexImage2D(
+                gl.GL_TEXTURE_2D,
+                0,
+                gl.GL_RGB,
+                dimensions.x,
+                dimensions.y,
+                0,
+                gl.GL_BGR,
+                gl.GL_UNSIGNED_BYTE,
+                @ptrCast(image.getPixels())
+            );
+        },
+        .png => {
+            gl.glTexImage2D(
+                gl.GL_TEXTURE_2D,
+                0,
+                gl.GL_RGBA,
+                dimensions.x,
+                dimensions.y,
+                0,
+                gl.GL_RGBA,
+                gl.GL_UNSIGNED_BYTE,
+                @ptrCast(image.getPixels())
+            );
+        }
+    }
 
     // Initialize vertex array, required before OpenGL can draw
     var vao: u32 = 0;

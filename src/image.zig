@@ -9,6 +9,13 @@ pub const ImageFile = union(FileType) {
     bitmap: Bitmap,
     png: PNG,
 
+    pub fn getFileName(self: ImageFile) []const u8 {
+        return switch (self) {
+            .bitmap => |b| b.file_name,
+            .png => |p| p.file_name
+        };
+    }
+
     pub fn getFileType(self: ImageFile) FileType {
         return switch(self) {
             .png => FileType.png,

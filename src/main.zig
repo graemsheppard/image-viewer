@@ -12,7 +12,7 @@ const print = std.debug.print;
 
 pub fn main() void {
     const allocator = std.heap.page_allocator;
-    const file_name = "snail.png";
+    const file_name = "snail.bmp";
 
     const file = std.fs.cwd().openFile(file_name, .{}) catch {
         print("Could not open file.\n", .{});

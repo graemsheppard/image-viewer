@@ -22,7 +22,7 @@ pub const PNG = struct {
         if (signature != 0x504E47) return FileFormatError.InvalidFileHeader;
 
         var chunks = ArrayList(Chunk).initCapacity(allocator, 3) catch return FileFormatError.InvalidFileHeader;
-        _ = fixed_codes;
+
         // IHDR chunk must come first and have data of 13-bytes
         const ihdr_chunk = Chunk.parse(8, data);
 
@@ -32,6 +32,7 @@ pub const PNG = struct {
         const ihdr = try IHDR.parse(ihdr_chunk);
         const bpp = ihdr.getBitsPerPixel();
         const bytes_per_row = (bpp * ihdr.width + 7) / 8;
+        const total_pixels = ihdr.width * ihdr.height;
         const total_size = (bytes_per_row + 1) * ihdr.height;
 
         const plte_required = ihdr.color_type == 3;
@@ -91,30 +92,62 @@ pub const PNG = struct {
         // Process the zlib stream 1 block at a time, each block starts with 3-bit header
         while (try parseBlock(allocator, &stream, output_buffer, &output_idx)) {}
 
-        var pixels = allocator.alloc(u8, output_buffer.len * 4) catch return FileFormatError.CorruptedData;
+        var pixels = allocator.alloc(u8, total_pixels * 4) catch return FileFormatError.CorruptedData;
         @memset(pixels, 0);
 
+        std.debug.print("{}\n{}\n", .{ bpp, ihdr.color_type });
+
         // Unfilter the pixels by scanline, each scanline could have a different filter method
+        const bypp = (bpp + 7) / 8;
         for (0..ihdr.height) |scanline_idx| {
-            const offset = (bytes_per_row + 1) * scanline_idx;
-            const scanline = output_buffer[offset..(offset + bytes_per_row + 1)];
-            const filter_byte = scanline[0];
+            const stride = bytes_per_row + 1;
+            const scanline = output_buffer[(scanline_idx * stride)..((scanline_idx + 1) * stride)];
+            const filter_type = scanline[0];
             const line_data = scanline[1..];
 
-            switch(filter_byte) {
-                0 => {
-                    for (line_data, 0..) |pixel, pixel_idx| {
-                        const colors = plte.?.colors[pixel];
-                        const alpha = if (trns) |trns_chunk| trns_chunk.alphaAt(pixel) else 0xff;
-                        for (colors, 0..) |color, color_idx| {
-                            pixels[4 * (scanline_idx * ihdr.width + pixel_idx) + color_idx] = color;
-                        }
-                        pixels[4 * (scanline_idx * ihdr.width + pixel_idx) + 3] = alpha;
-                    }
-                },
-                else => unreachable
+            for (line_data, 0..) |*byte, byte_idx| {
+                const a = if (byte_idx >= bypp) line_data[byte_idx - bypp] else 0;
+                const b = if (scanline_idx > 0) output_buffer[(scanline_idx - 1) * stride + 1 + byte_idx] else 0;
+                const c = if (byte_idx >= bypp and scanline_idx > 0) output_buffer[(scanline_idx - 1) * stride + 1 + byte_idx - bypp] else 0;
+
+                byte.* = switch(filter_type) {
+                    0 => byte.*,
+                    1 => byte.* +% a,
+                    2 => byte.* +% b,
+                    3 => byte.* +% @as(u8, @truncate((@as(u16, a) + b) / 2)),
+                    4 => byte.* +% paethPredictor(a, b, c),
+                    else => return FileFormatError.UnsupportedFormat
+                };
             }
 
+            for (0..ihdr.width) |x| {
+                const dest_idx = (scanline_idx * ihdr.width + x) * 4;
+                switch (ihdr.color_type) {
+                    3 => { 
+                        const palette_idx = line_data[x];
+                        const rgb = plte.?.colors[palette_idx];
+                        const alpha = if (trns) |t| t.alphaAt(palette_idx) else 0xff;
+                        
+                        pixels[dest_idx + 0] = rgb[0];
+                        pixels[dest_idx + 1] = rgb[1];
+                        pixels[dest_idx + 2] = rgb[2];
+                        pixels[dest_idx + 3] = alpha;
+                    },
+                    2 => { 
+                        pixels[dest_idx + 0] = line_data[x * 3 + 0];
+                        pixels[dest_idx + 1] = line_data[x * 3 + 1];
+                        pixels[dest_idx + 2] = line_data[x * 3 + 2];
+                        pixels[dest_idx + 3] = 0xff;
+                    },
+                    6 => { 
+                        pixels[dest_idx + 0] = line_data[x * 4 + 0];
+                        pixels[dest_idx + 1] = line_data[x * 4 + 1];
+                        pixels[dest_idx + 2] = line_data[x * 4 + 2];
+                        pixels[dest_idx + 3] = line_data[x * 4 + 3];
+                    },
+                    else => unreachable
+                }
+            }
         } 
 
         return .{
@@ -127,6 +160,21 @@ pub const PNG = struct {
             .bytes_per_row = bytes_per_row,
             .pixels = pixels
         };
+    }
+
+    fn paethPredictor(a: u8, b: u8, c: u8) u8 {
+        const ia = @as(i16, a);
+        const ib = @as(i16, b);
+        const ic = @as(i16, c);
+        const p = ia + ib - ic;
+
+        const pa = @abs(p - ia);
+        const pb = @abs(p - ib);
+        const pc = @abs(p - ic);
+
+        if (pa <= pb and pa <= pc) return a;
+        if (pb <= pc) return b;
+        return c;
     }
 
     /// Parses a block from the stream, storing the partial result in the buffer. Assumes we are at the strat of the block including header
@@ -512,7 +560,7 @@ pub const IHDR = struct {
             0, 3 => self.bit_depth,     // Grayscale, Indexed(Palette)
             2 => self.bit_depth * 3,    // RGB
             4 => self.bit_depth * 2,    // Grayscale w/ alpha
-            5 => self.bit_depth * 4,     // RGBA
+            5 => self.bit_depth * 4,    // RGBA
             else => unreachable
         };
     }
